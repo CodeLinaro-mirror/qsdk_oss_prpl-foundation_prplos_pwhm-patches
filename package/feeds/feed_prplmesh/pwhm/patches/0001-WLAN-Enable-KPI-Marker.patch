@@ -1,0 +1,74 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 3789110455b920ac3a11425006a92f59bc9c4dc9 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Fri, 9 Jan 2026 12:12:12 +0530
+Subject: [PATCH] WLAN Enable KPI Marker
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+
+---
+ src/wld_radio.c | 31 +++++++++++++++++++++++++++++++
+ 1 file changed, 31 insertions(+)
+
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 9ec5e22..dcb5461 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -127,6 +127,12 @@ const char* Rad_SupGI[] = {"Auto", "400nsec", "800nsec", 0};
+ 
+ const char* wld_rad_autoBwSelectMode_str[] = {"MaxAvailable", "MaxCleared", "Default", NULL};
+ 
++// declaration for WLAN start KPI
++static void wld_update_wlan_start_kpi(void);
++
++// Static variables for KPI tracking
++static bool kpi_wlan_started = false;
++
+ const char* cstr_chanmgt_rad_state[CM_RAD_MAX + 1] = {
+     "Unknown",
+     "Down",
+@@ -4403,6 +4409,13 @@ void wld_rad_updateState(T_Radio* pRad, bool forceVapUpdate) {
+         pRad->changeInfo.lastStatusChange = swl_time_getMonoSec();
+         pRad->changeInfo.nrStatusChanges++;
+ 
++        // Mark "Start WLAN Enable" when first radio becomes operational
++        // Operational states: DORMANT, UP (not ERROR, LLDOWN, NOTPRESENT, DOWN)
++        if(oldStatus == RST_UNKNOWN &&
++           (pRad->status == RST_DORMANT || pRad->status == RST_UP)) {
++            wld_update_wlan_start_kpi();
++        }
++
+         if((pRad->pBus != NULL) && (pRad->hasDmReady)) {
+             amxd_trans_t trans;
+             ASSERT_TRANSACTION_INIT(pRad->pBus, &trans, , ME, "%s : trans init failure", pRad->Name);
+@@ -4436,6 +4449,24 @@ void wld_rad_updateState(T_Radio* pRad, bool forceVapUpdate) {
+     wld_radStaMon_updateActive(pRad);
+ }
+ 
++static void wld_update_wlan_start_kpi(void) {
++    // Only mark once for the entire WLAN subsystem
++    if (!kpi_wlan_started) {
++        char cmd[256];
++        snprintf(cmd, sizeof(cmd),
++                "echo -n 'M - Start WLAN Enable' >> /sys/kernel/boot_kpi/kpi_values");
++
++        int ret = system(cmd);
++
++        if (ret != 0) {
++            SAH_TRACEZ_ERROR(ME, "Error updating KPI - Start WLAN Enable");
++        } else {
++            SAH_TRACEZ_INFO(ME, "Updated KPI - Start WLAN Enable");
++            kpi_wlan_started = true;
++        }
++    }
++}
++
+ void wld_rad_triggerChangeEvent(T_Radio* pRad, wld_rad_changeEvent_e event, void* data) {
+     wld_rad_changeEvent_t changeEv;
+     changeEv.pRad = pRad;
+-- 
+2.34.1
+
