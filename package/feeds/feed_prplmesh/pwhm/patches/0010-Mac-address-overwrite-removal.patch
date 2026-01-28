@@ -1,0 +1,45 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 8362f3582197d9a4eb5d5ddf116d6a24a9732344 Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Wed, 28 Jan 2026 17:49:47 +0530
+Subject: [PATCH] Mac address overwrite removal
+
+* Retrieve the radio MAC address using `wld_linuxIfUtils_getMacExt` in `wld_rad_macCfg_updateRadBaseMac`
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+---
+ src/RadMgt/wld_rad_macCfg.c | 6 ++++++--
+ 1 file changed, 5 insertions(+), 1 deletions(-)
+
+diff --git a/src/RadMgt/wld_rad_macCfg.c b/RadMgt/wld_rad_macCfg.c
+index e718129..b01515d 100644
+--- a/src/RadMgt/wld_rad_macCfg.c
++++ b/src/RadMgt/wld_rad_macCfg.c
+@@ -66,6 +66,7 @@
+ #include "wld/wld_radio.h"
+ #include "wld/wld_util.h"
+ #include "wld/wld_ssid.h"
++#include "wld/wld_linuxIfUtils.h"
+ #include "swl/swl_common.h"
+ #include "swl/swl_common_mac.h"
+
+@@ -236,8 +237,11 @@ bool wld_rad_macCfg_updateRadBaseMac(T_Radio* pRad) {
+     T_Radio* prevRad = wld_rad_prevRadFromObj(pRad->pBus);
+     swl_macBin_t prevMacAddr;
+     memcpy(prevMacAddr.bMac, pRad->MACAddr, SWL_MAC_BIN_LEN);
+
+-    if(pRad->macCfg.useBaseMacOffset) {
++    swl_macBin_t hwMac;
++    if(wld_linuxIfUtils_getMacExt(pRad->Name, &hwMac) == SWL_RC_OK) {
++        memcpy(pRad->MACAddr, hwMac.bMac, SWL_MAC_BIN_LEN);
++    } else if(pRad->macCfg.useBaseMacOffset) {
+         memcpy(pRad->MACAddr, wld_getWanAddr()->bMac, ETHER_ADDR_LEN);
+         swl_mac_binAddVal((swl_macBin_t*) pRad->MACAddr, pRad->macCfg.baseMacOffset, -1);
+     } else if(prevRad != NULL) {
+-- 
+2.34.1
+
