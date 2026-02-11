@@ -1,0 +1,31 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+From f9677dabfd67054806f5d57ceb1f2fd7e9b2f322 Mon Sep 17 00:00:00 2001
+From: Srajana <srajana@qti.qualcomm.com>
+Date: Wed, 11 Feb 2026 13:43:38 +0530
+Subject: [PATCH] <fix-for-AutoChannelRefreshPeriod-bound-check>
+
+---
+ odl/wld_radio.odl | 4 +++-
+ 1 file changed, 3 insertions(+), 1 deletion(-)
+
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 1be15fb..ddf873c 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -747,7 +747,9 @@ define probelist_t{
+ 		 * automatic channel selection is done only at boot time. This
+ 		 * parameter is significant only if AutoChannelEnable is set to
+ 		 * true. </p> */
+-		%persistent uint32 AutoChannelRefreshPeriod;
++		%persistent uint32 AutoChannelRefreshPeriod{
++                        on action validate call check_range { min = 0, max = 4294967295 };
++                }
+ 
+ 		/**
+ 		 * <p>Rerun auto channel selection explicitly, if it was enabled. </p>
+-- 
+2.34.1
+
