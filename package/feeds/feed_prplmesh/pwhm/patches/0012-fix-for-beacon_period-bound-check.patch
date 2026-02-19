@@ -1,0 +1,29 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+From 00c1f23e3c925daa1824449003808eabe5cc4a9c Mon Sep 17 00:00:00 2001
+From: Srajana <srajana@qti.qualcomm.com>
+Date: Thu, 19 Feb 2026 00:48:14 +0530
+Subject: [PATCH] fix-for-beacon_period-bound-check
+Signed-off-by: Srajana <srajana@qti.qualcomm.com>
+
+---
+ odl/wld_radio.odl | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index ddf873c..6fc6d09 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -1014,6 +1014,7 @@ define probelist_t{
+ 		* @version 9.2
+ 		*/
+ 		%persistent uint32 BeaconPeriod{
++			on action validate call check_range { min = 100, max = 10000 };
+ 			default 100;
+ 		}
+ 
+-- 
+2.34.1
+
