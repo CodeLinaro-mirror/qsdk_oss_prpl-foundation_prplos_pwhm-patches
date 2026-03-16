@@ -1,0 +1,53 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 572edbf4bf0259d28bce5adb9f1a57c9fd46ff94 Mon Sep 17 00:00:00 2001
+From: rayakuma <rayakuma@qti.qualcomm.com>
+Date: Wed, 18 Feb 2026 22:52:58 +0530
+Subject: [PATCH] 6GHz maxbandwidth fix
+Signed-off-by: Rohith Kumar <rayakuma@qti.qualcomm.com>
+
+---
+ wld_util.c | 17 ++++++++++++++++-
+ 1 file changed, 16 insertions(+), 1 deletion(-)
+
+diff --git a/src/wld_util.c b/src/wld_util.c
+index d847006..ac40b87 100644
+--- a/src/wld_util.c
++++ b/src/wld_util.c
+@@ -2157,9 +2157,25 @@ char* wldu_getLocalFile(char* buffer, size_t bufSize, char* path, char* format,
+ }
+ 
+ swl_bandwidth_e wld_util_getMaxBwCap(wld_assocDev_capabilities_t* caps) {
++#ifdef M_SWL_STACAP_EHT_320MHZ
++    if(caps->ehtCapabilities & M_SWL_STACAP_EHT_320MHZ) {
++        return SWL_BW_320MHZ;
++    }
++#endif
++    if((caps->supportedHe160MCS[SWL_COM_DIR_RECEIVE].nssNbr > 0) ||
++       (caps->supportedHe160MCS[SWL_COM_DIR_TRANSMIT].nssNbr > 0) ||
++       (caps->supportedHe80x80MCS[SWL_COM_DIR_RECEIVE].nssNbr > 0) ||
++       (caps->supportedHe80x80MCS[SWL_COM_DIR_TRANSMIT].nssNbr > 0)) {
++        return SWL_BW_160MHZ;
++    }
+     if(caps->vhtCapabilities & M_SWL_STACAP_VHT_SGI160) {
+         return SWL_BW_160MHZ;
+     }
++    if(((caps->freqCapabilities & M_SWL_FREQ_BAND_EXT_5GHZ) || (caps->freqCapabilities & M_SWL_FREQ_BAND_EXT_6GHZ)) &&
++       ((caps->supportedHeMCS[SWL_COM_DIR_RECEIVE].nssNbr > 0) ||
++        (caps->supportedHeMCS[SWL_COM_DIR_TRANSMIT].nssNbr > 0))) {
++        return SWL_BW_80MHZ;
++    }
+     if(caps->vhtCapabilities & M_SWL_STACAP_VHT_SGI80) {
+         return SWL_BW_80MHZ;
+     }
+@@ -2452,4 +2468,3 @@ wld_spectrumChannelInfoEntry_t* wld_util_addorUpdateSpectrumEntry(amxc_llist_t*
+     }
+     return pEntry;
+ }
+-
+-- 
+2.34.1
+
