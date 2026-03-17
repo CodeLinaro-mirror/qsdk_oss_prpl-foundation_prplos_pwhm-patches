@@ -1,0 +1,87 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From bd9f1327a11187a6abc1568c053bdcc6ca41962f Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Wed, 11 Mar 2026 23:49:37 +0530
+Subject: [PATCH] WLAN Enabled on BootUp KPI Marker
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+
+---
+ src/wld_radio.c | 39 ++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index dcb5461..eca46ed 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -127,11 +127,13 @@ const char* Rad_SupGI[] = {"Auto", "400nsec", "800nsec", 0};
+ 
+ const char* wld_rad_autoBwSelectMode_str[] = {"MaxAvailable", "MaxCleared", "Default", NULL};
+ 
+-// declaration for WLAN start KPI
++// declarations for WLAN KPIs
+ static void wld_update_wlan_start_kpi(void);
++static void wld_check_wlan_enabled_on_bootup(void);
+ 
+ // Static variables for KPI tracking
+ static bool kpi_wlan_started = false;
++static bool kpi_wlan_enabled_on_bootup = false;
+ 
+ const char* cstr_chanmgt_rad_state[CM_RAD_MAX + 1] = {
+     "Unknown",
+@@ -4416,6 +4418,11 @@ void wld_rad_updateState(T_Radio* pRad, bool forceVapUpdate) {
+             wld_update_wlan_start_kpi();
+         }
+ 
++        // Check if all radios are now operational for "WLAN Enabled on Bootup" KPI
++        if(pRad->status == RST_DORMANT || pRad->status == RST_UP) {
++            wld_check_wlan_enabled_on_bootup();
++        }
++
+         if((pRad->pBus != NULL) && (pRad->hasDmReady)) {
+             amxd_trans_t trans;
+             ASSERT_TRANSACTION_INIT(pRad->pBus, &trans, , ME, "%s : trans init failure", pRad->Name);
+@@ -4467,6 +4474,36 @@ static void wld_update_wlan_start_kpi(void) {
+     }
+ }
+ 
++static void wld_check_wlan_enabled_on_bootup(void) {
++    // Only mark once for the entire WLAN subsystem
++    if(kpi_wlan_enabled_on_bootup) {
++        return;
++    }
++
++    // Check if ALL radios have become operational (RST_UP or RST_DORMANT).
++    // This is independent of WiFi.SSID.*.Enable state.
++    T_Radio* pRad = NULL;
++    wld_for_eachRad(pRad) {
++        if(pRad->status != RST_UP && pRad->status != RST_DORMANT) {
++            // At least one radio is not yet operational
++            return;
++        }
++    }
++
++    // All radios are operational - WLAN subsystem is fully enabled on bootup
++    char cmd[256];
++    snprintf(cmd, sizeof(cmd),
++             "echo -n 'M - WLAN Enabled on Bootup' >> /sys/kernel/boot_kpi/kpi_values");
++
++    int ret = system(cmd);
++    if(ret != 0) {
++        SAH_TRACEZ_ERROR(ME, "Error updating KPI - WLAN Enabled on Bootup");
++    } else {
++        SAH_TRACEZ_INFO(ME, "Updated KPI - WLAN Enabled on Bootup");
++        kpi_wlan_enabled_on_bootup = true;
++    }
++}
++
+ void wld_rad_triggerChangeEvent(T_Radio* pRad, wld_rad_changeEvent_e event, void* data) {
+     wld_rad_changeEvent_t changeEv;
+     changeEv.pRad = pRad;
+-- 
+2.34.1
+
