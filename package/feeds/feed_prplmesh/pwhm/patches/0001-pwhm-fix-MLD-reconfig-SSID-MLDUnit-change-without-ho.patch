@@ -1,0 +1,312 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From f7a76cbe7ddfc72dd46985e6dc0fb1d2b48e30be Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Mon, 30 Mar 2026 21:58:29 +0530
+Subject: [PATCH] pwhm: fix MLD reconfig SSID/MLDUnit change without hostapd
+ restart
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ include_priv/Plugin/wifiGen_fsm.h |  1 +
+ include_priv/Plugin/wifiGen_mld.h |  1 +
+ src/Plugin/wifiGen_fsm.c          | 30 +++++++++-
+ src/Plugin/wifiGen_mld.c          | 50 ++++++++++++++++
+ src/Plugin/wifiGen_vap.c          | 11 +++-
+ src/wld_ssid.c                    | 99 ++++++++++++++++++++++++++++++-
+ 6 files changed, 189 insertions(+), 3 deletions(-)
+
+diff --git a/include_priv/Plugin/wifiGen_fsm.h b/include_priv/Plugin/wifiGen_fsm.h
+index 2d9f84f..34c897d 100644
+--- a/include_priv/Plugin/wifiGen_fsm.h
++++ b/include_priv/Plugin/wifiGen_fsm.h
+@@ -72,6 +72,7 @@ typedef enum {
+     GEN_FSM_MOD_COUNTRYCODE,      /* Modify the country code */
+     GEN_FSM_MOD_BSSID,            /* Modify the BSSID */
+     GEN_FSM_MOD_MLD,              /* Sync MLD params */
++    GEN_FSM_MOD_MLD_CONF,         /* Reconfigure MLD conf via config reload (no full restart) */
+     GEN_FSM_MOD_SEC,              /* Set AP Security */
+     GEN_FSM_MOD_AP,               /* Sync AP non-security params */
+     GEN_FSM_MOD_SSID,             /* Set SSID */
+diff --git a/include_priv/Plugin/wifiGen_mld.h b/include_priv/Plugin/wifiGen_mld.h
+index 6a27b16..abad877 100644
+--- a/include_priv/Plugin/wifiGen_mld.h
++++ b/include_priv/Plugin/wifiGen_mld.h
+@@ -68,6 +68,7 @@
+ 
+ T_SSID* wifiGen_mld_fetchSockLinkSSID(wld_wpaCtrlMngr_t* pMgr, const char* sockName);
+ T_SSID* wifiGen_mld_selectPrimLinkSSID(T_SSID* pSSID);
++swl_rc_ne wifiGen_mld_reconfigureNeighLinkAPs(T_SSID* pSSID);
+ swl_rc_ne wifiGen_mld_reconfigureNeighLinkSSIDs(T_SSID* pSSID);
+ 
+ #endif /* INCLUDE_PRIV_PLUGIN_WIFIGEN_MLD_H_ */
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 06d08e7..8e7dd3a 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -677,6 +677,32 @@ static bool s_doSetApSec(T_AccessPoint* pAP, T_Radio* pRad _UNUSED) {
+     return true;
+ }
+ 
++static bool s_doSetApMldConf(T_AccessPoint* pAP, T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
++    ASSERTI_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
++    ASSERTI_TRUE(wld_rad_isMloCapable(pRad), true, ME, "%s: not mlo capable", pRad->Name);
++    /*
++     * Send SIGHUP directly to the shared hostapd group process.
++     *
++     * Using wld_secDmn_reload() instead of GEN_FSM_UPDATE_HOSTAPD avoids the
++     * wpaCtrl socket path (wld_rad_hostapd_reconfigure) which times out when
++     * the link socket changes name during an MLD group reconfiguration (e.g.
++     * wlan21_link2 is closed by hostapd mid-reload and the OK response never
++     * arrives within the 1s deadline).
++     *
++     * SIGHUP is process-level: hostapd reloads its config file and updates MLD
++     * group membership for all links without tearing down the process, so the
++     * kernel nl80211 state and client associations are preserved.
++     *
++     * This covers both departure (N-link -> (N-1)-link) and re-join
++     * ((N-1)-link -> N-link) cases. The wpaCtrlMngr reconnects to the new
++     * socket layout automatically via s_mngrReadyCb after the reload.
++     */
++    SAH_TRACEZ_INFO(ME, "%s: mld conf refresh via SIGHUP (no full restart)", pAP->alias);
++    wld_secDmn_reload(pRad->hostapd);
++    return true;
++}
++
+ static bool s_doSetApMld(T_AccessPoint* pAP, T_Radio* pRad) {
+     ASSERTS_NOT_NULL(pAP, true, ME, "NULL");
+     ASSERTI_TRUE(wifiGen_hapd_isRunning(pRad), true, ME, "%s: hostapd stopped", pRad->Name);
+@@ -937,6 +963,7 @@ static void s_checkApDependency(T_AccessPoint* pAP, T_Radio* pRad) {
+         setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_START_HOSTAPD);
+     }
+     if((isBitSetLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD)) ||
++       (isBitSetLongArray(pAP->fsm.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD_CONF)) ||
+        (s_fetchDynConfAction(pAP->fsm.FSM_AC_BitActionArray, FSM_BW) >= 0)) {
+         setBitLongArray(pRad->fsmRad.FSM_AC_BitActionArray, FSM_BW, GEN_FSM_MOD_HOSTAPD);
+         if(!wifiGen_hapd_isAlive(pRad)) {
+@@ -1009,6 +1036,7 @@ wld_fsmMngr_action_t actions[GEN_FSM_MAX] = {
+     {FSM_ACTION(GEN_FSM_MOD_COUNTRYCODE), .doRadFsmAction = s_doSetCountryCode},
+     {FSM_ACTION(GEN_FSM_MOD_BSSID), .doVapFsmAction = s_doSetBssid},
+     {FSM_ACTION(GEN_FSM_MOD_MLD), .doVapFsmAction = s_doSetApMld},
++    {FSM_ACTION(GEN_FSM_MOD_MLD_CONF), .doVapFsmAction = s_doSetApMldConf},
+     {FSM_ACTION(GEN_FSM_MOD_SEC), .doVapFsmAction = s_doSetApSec},
+     {FSM_ACTION(GEN_FSM_MOD_AP), .doVapFsmAction = s_doSyncAp},
+     {FSM_ACTION(GEN_FSM_MOD_SSID), .doVapFsmAction = s_doSetSsid},
+@@ -1156,7 +1184,7 @@ static void s_mldChange(wld_mldChange_t* event) {
+     ASSERT_NOT_NULL(pRad, , ME, "No link radio");
+     ASSERTS_EQUALS(pRad->vendor->fsmMngr, &mngr, , ME, "%s: radio managed by vendor specific FSM", pRad->Name);
+     if(event->event == WLD_MLD_EVT_UPDATE) {
+-        wifiGen_mld_reconfigureNeighLinkSSIDs(pSSID);
++        wifiGen_mld_reconfigureNeighLinkAPs(pSSID);
+     }
+ }
+ 
+diff --git a/src/Plugin/wifiGen_mld.c b/src/Plugin/wifiGen_mld.c
+index 7d6d0f7..b55618c 100644
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -71,6 +71,7 @@
+ #include "wld/wld_rad_hostapd_api.h"
+ #include "wld/Utils/wld_autoCommitMgr.h"
+ #include "wifiGen_hapd.h"
++#include "wifiGen_fsm.h"
+ 
+ #define ME "genMld"
+ 
+@@ -217,6 +218,55 @@ T_SSID* wifiGen_mld_selectPrimLinkSSID(T_SSID* pSSID) {
+     return pSSID;
+ }
+ 
++swl_rc_ne wifiGen_mld_reconfigureNeighLinkAPs(T_SSID* pSSID) {
++    ASSERTS_NOT_NULL(pSSID, SWL_RC_INVALID_PARAM, ME, "NULL");
++    if(!wld_rad_firstCommitFinished(pSSID->RADIO_PARENT)) {
++        SAH_TRACEZ_INFO(ME, "%s: still in first commit, no need to reconfigure", pSSID->Name);
++        return SWL_RC_OK;
++    }
++
++    wld_mldLink_t* pLink = pSSID->pMldLink;
++    wld_for_eachNeighMldLink_safe(pNgLink, pLink) {
++        if(pNgLink == pLink) {
++            continue;
++        }
++        T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++        if(pNgSSID->AP_HOOK != NULL) {
++            T_AccessPoint* pNgAP = pNgSSID->AP_HOOK;
++            bool isConfigured = wld_mld_isLinkConfigured(pNgLink);
++            bool isUsable = wld_mld_isLinkUsable(pNgLink);
++            wld_mldLink_t* pPrimLink = wld_mld_getPrimaryLink(pNgLink);
++            bool needUpdateConf = false;
++            if(isConfigured != isUsable) {
++                needUpdateConf = isConfigured;
++            } else if(isConfigured && (pPrimLink == pLink)) {
++                needUpdateConf = true;
++            } else {
++                continue;
++            }
++            if(needUpdateConf) {
++                wld_mld_saveLinkConfigured(pNgLink, false);
++            }
++            SAH_TRACEZ_INFO(ME, "mark AP %s for mld conf refresh - (s_reconfigureNeighLinkAPs@wifiGen_mld.c)",
++                            wld_mld_getLinkName(pNgLink));
++            /*
++             * Use GEN_FSM_MOD_MLD_CONF instead of mfn_wvap_setMldUnit to avoid the
++             * toggle->restart escalation in s_schedNextAction when MLD is active.
++             * This schedules a direct VAP toggle (DISABLE+ENABLE) which reconfigures
++             * the MLD links without a full hostapd restart, preserving client connections.
++             */
++            setBitLongArray(pNgAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD_CONF);
++            wld_autoCommitMgr_notifyVapEdit(pNgAP);
++        }
++    }
++    if(pSSID->AP_HOOK != NULL) {
++        T_AccessPoint* pAP = pSSID->AP_HOOK;
++        SAH_TRACEZ_INFO(ME, "mark AP %s for mld conf refresh", pSSID->Name);
++        setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD_CONF);
++    }
++    return SWL_RC_OK;
++}
++
+ swl_rc_ne wifiGen_mld_reconfigureNeighLinkSSIDs(T_SSID* pSSID) {
+     ASSERTS_NOT_NULL(pSSID, SWL_RC_INVALID_PARAM, ME, "NULL");
+     if(!wld_rad_firstCommitFinished(pSSID->RADIO_PARENT)) {
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+index adae53b..a7c0c84 100644
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -485,7 +485,16 @@ swl_rc_ne wifiGen_vap_setMldUnit(T_AccessPoint* pAP) {
+     ASSERT_NOT_NULL(pRad, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERTI_TRUE(wld_rad_isMloCapable(pRad), SWL_RC_OK, ME, "%s: not mlo capable", pRad->Name);
+     SAH_TRACEZ_INFO(ME, "%s: applying MLDUnit %d", pAP->alias, pAP->pSSID->mldUnit);
+-    setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD);
++    /*
++     * If hostapd is already running this is an MLD reconfiguration (e.g. 3-link -> 2-link).
++     * Use GEN_FSM_MOD_MLD_CONF so the FSM performs a config reload instead of escalating
++     * to a full hostapd process restart which would disconnect all associated clients.
++     */
++    if(wifiGen_hapd_isRunning(pRad)) {
++        setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD_CONF);
++    } else {
++        setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD);
++    }
+     return SWL_RC_OK;
+ }
+ 
+diff --git a/src/wld_ssid.c b/src/wld_ssid.c
+index ea852d7..12532b3 100644
+--- a/src/wld_ssid.c
++++ b/src/wld_ssid.c
+@@ -872,9 +872,106 @@ static void s_setSSID_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_param_
+     if(pAP) {
+         SAH_TRACEZ_INFO(ME, "%s: apply to AP %p", pSSID->Name, pAP);
+         pAP->pFA->mfn_wvap_ssid(pAP, (char*) SSID, strlen(SSID), SET);
++
++        /* If this SSID is part of an MLD group and the new SSID differs from the
++         * group's shared SSID, remove this link from the MLD group
++         * the departing link becomes a standalone SLO AP, and the remaining
++         * links reconfig as an (N-1)-link MLD via the MLD-aware FSM path.
++         *
++         * Guard: skip departure if the new SSID matches a sibling's SSID.
++         * This prevents a false departure when s_setSSIDConf_ocf already called
++         * s_checkMLDUnit which re-registered the link (pMldLink becomes non-NULL)
++         * before s_setSSID_pwf runs — without this guard the re-join done by
++         * s_checkMLDUnit would be immediately undone here. */
++        wld_mldLink_t* pMldLink = pSSID->pMldLink;
++        bool ssidMatchesSibling = false;
++        if((pMldLink != NULL) && (wld_mld_countNeighLinks(pMldLink) > 1)) {
++            wld_mldLink_t* pNgChk = wld_mld_firstNeighLink(pMldLink);
++            while(pNgChk != NULL) {
++                if(pNgChk != pMldLink) {
++                    T_SSID* pNgChkSSID = wld_mld_getLinkSsid(pNgChk);
++                    if((pNgChkSSID != NULL) && swl_str_matches(SSID, pNgChkSSID->SSID)) {
++                        ssidMatchesSibling = true;
++                        break;
++                    }
++                }
++                pNgChk = wld_mld_nextNeighLink(pNgChk);
++            }
++        }
++        if((pMldLink != NULL) && (wld_mld_countNeighLinks(pMldLink) > 1) && !ssidMatchesSibling) {
++            SAH_TRACEZ_INFO(ME, "%s: SSID change on MLD member - removing from MLD group (unit %d)",
++                            pSSID->Name, pSSID->mldUnit);
++
++            /* Notify each sibling link to reconfig as a smaller MLD group.
++             * Must iterate before unregistering so the neighbour list is still intact. */
++            wld_mldLink_t* pNgLink = wld_mld_firstNeighLink(pMldLink);
++            while(pNgLink != NULL) {
++                wld_mldLink_t* pNext = wld_mld_nextNeighLink(pNgLink);
++                if(pNgLink != pMldLink) {
++                    T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++                    if((pNgSSID != NULL) && (pNgSSID->AP_HOOK != NULL)) {
++                        T_AccessPoint* pNgAP = pNgSSID->AP_HOOK;
++                        SAH_TRACEZ_INFO(ME, "%s: trigger MLD reconfig on sibling link %s",
++                                        pSSID->Name, pNgSSID->Name);
++                        pNgAP->pFA->mfn_wvap_setMldUnit(pNgAP);
++                        wld_autoCommitMgr_notifyVapEdit(pNgAP);
++                    }
++                }
++                pNgLink = pNext;
++            }
++
++            /* Remove this link from the MLD group and mark it as non-MLD. */
++            wld_mld_unregisterLink(pSSID);
++            pSSID->mldUnit = -1;
++
++            /* Reconfigure the departing link as a standalone SLO AP. */
++            pAP->pFA->mfn_wvap_setMldUnit(pAP);
++        } else if(pMldLink != NULL) {
++            if(ssidMatchesSibling) {
++                /* Re-join: s_setSSIDConf_ocf already called s_checkMLDUnit which
++                 * re-registered this link (pMldLink became non-NULL) before we got
++                 * here. The link is rejoining an N-link group — notify each sibling
++                 * to reconfig as an (N+1)-link MLD via the MLD-aware FSM path. */
++                SAH_TRACEZ_INFO(ME, "%s: SSID change re-joins MLD group - notifying siblings",
++                                pSSID->Name);
++                wld_mldLink_t* pNgLink = wld_mld_firstNeighLink(pMldLink);
++                while(pNgLink != NULL) {
++                    wld_mldLink_t* pNext = wld_mld_nextNeighLink(pNgLink);
++                    if(pNgLink != pMldLink) {
++                        T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++                        if((pNgSSID != NULL) && (pNgSSID->AP_HOOK != NULL)) {
++                            T_AccessPoint* pNgAP = pNgSSID->AP_HOOK;
++                            SAH_TRACEZ_INFO(ME, "%s: trigger MLD reconfig on sibling link %s",
++                                            pSSID->Name, pNgSSID->Name);
++                            pNgAP->pFA->mfn_wvap_setMldUnit(pNgAP);
++                            wld_autoCommitMgr_notifyVapEdit(pNgAP);
++                        }
++                    }
++                    pNgLink = pNext;
++                }
++            } else {
++                /* Still in a 1-member group: mark unconfigured so hostapd reloads. */
++                wld_mld_setLinkConfigured(pMldLink, false);
++            }
++        } else {
++            /* pMldLink == NULL: this link was previously ejected from an MLD group.
++             * If the DM MLDUnit is still valid, re-register the link so it rejoins
++             * the group (e.g. SSID changed back to the group SSID).
++             * s_checkMLDUnit sees mldUnit(-1) != dmUnit(>=0) and calls
++             * wld_mld_registerLink + mfn_wvap_setMldUnit on this AP.
++             * After registration, fire setLinkConfigured to emit WLD_MLD_EVT_UPDATE
++             * so sibling links reconfig as N+1 MLD via reconfigureNeighLinkAPs. */
++            int32_t dmMldUnit = amxd_object_get_int32_t(object, "MLDUnit", NULL);
++            if(dmMldUnit >= 0) {
++                SAH_TRACEZ_INFO(ME, "%s: SSID change re-joins MLD group (unit %d)",
++                                pSSID->Name, dmMldUnit);
++                s_checkMLDUnit(pSSID, dmMldUnit);
++                wld_mld_setLinkConfigured(pSSID->pMldLink, false);
++            }
++        }
++
+         wld_autoCommitMgr_notifyVapEdit(pAP);
+         wld_autoNeighAdd_vapSetDelNeighbourAP(pAP, true);
+-        wld_mld_setLinkConfigured(pSSID->pMldLink, false);
+     }
+     free(SSID);
+     //Setting endpoint ssid should only be done internally => no change necessary here.
+-- 
+2.34.1
+
