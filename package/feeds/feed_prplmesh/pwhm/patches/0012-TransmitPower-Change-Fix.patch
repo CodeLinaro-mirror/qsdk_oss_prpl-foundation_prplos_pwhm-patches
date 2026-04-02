@@ -1,0 +1,308 @@
+From b5ea0192d496d38d93df608f4eefbae57287fec2 Mon Sep 17 00:00:00 2001
+From: Ahmed JARRAYA <ahmed.jarraya@softathome.com>
+Date: Mon, 17 Nov 2025 16:00:20 +0100
+Subject: [PATCH] pWHM: changing TransmitPower value has no impact on txpower
+ from iw info
+
+Problem:
+- modifying the value of TransmitPower doesnt
+impact the value of txpower retrieved via iw info
+
+Fix:
+- use the index of the first active interface.
+- add linkid to nl80211 NL80211_CMD_SET_WIPHY call
+when setting radio Tx Power.
+
+Closes: PPW-331
+Signed-off-by: Ahmed JARRAYA <ahmed.jarraya@softathome.com>
+Signed-off-by: Jestin John Mathew <jestin-john.mathew_ext@softathome.com>
+---
+ include/wld/wld_nl80211_api.h | 55 +++++++++++++++++++++++++++
+ include/wld/wld_rad_nl80211.h | 12 ++++++
+ src/nl80211/wld_nl80211_api.c | 41 ++++++++++++++++----
+ src/nl80211/wld_rad_nl80211.c | 70 ++++++++++++++++++++++++++++-------
+ 4 files changed, 158 insertions(+), 20 deletions(-)
+
+diff --git a/include/wld/wld_nl80211_api.h b/include/wld/wld_nl80211_api.h
+index bffd7a897..654f5dd17 100644
+--- a/include/wld/wld_nl80211_api.h
++++ b/include/wld/wld_nl80211_api.h
+@@ -454,6 +454,19 @@ swl_rc_ne wld_nl80211_setWiphyAntennas(wld_nl80211_state_t* state, uint32_t ifIn
+  */
+ swl_rc_ne wld_nl80211_setTxPowerAuto(wld_nl80211_state_t* state, uint32_t ifIndex);
+ 
++/*
++ * @brief configure automatic transmit power level
++ * (Synchronous api)
++ *
++ * @param state nl80211 socket manager context
++ * @param ifIndex wiphy main iface index
++ * @param mloLinkId network interface MLO Link ID, otherwise MLO_LINK_ID_UNKNOWN for non-MLD
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_nl80211_setMloLinkTxPowerAuto(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId);
++
+ /*
+  * @brief configure fixed transmit power level
+  * (Synchronous api)
+@@ -467,6 +480,20 @@ swl_rc_ne wld_nl80211_setTxPowerAuto(wld_nl80211_state_t* state, uint32_t ifInde
+  */
+ swl_rc_ne wld_nl80211_setTxPowerFixed(wld_nl80211_state_t* state, uint32_t ifIndex, int32_t dbm);
+ 
++/*
++ * @brief configure fixed transmit power level
++ * (Synchronous api)
++ *
++ * @param state nl80211 socket manager context
++ * @param ifIndex wiphy main iface index
++ * @param mloLinkId network interface MLO Link ID, otherwise MLO_LINK_ID_UNKNOWN for non-MLD
++ * @param mbm transmit power level in dbm
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_nl80211_setMloLinkTxPowerFixed(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, int32_t dbm);
++
+ /*
+  * @brief configure limited transmit power level
+  * (Synchronous api)
+@@ -480,6 +507,20 @@ swl_rc_ne wld_nl80211_setTxPowerFixed(wld_nl80211_state_t* state, uint32_t ifInd
+  */
+ swl_rc_ne wld_nl80211_setTxPowerLimited(wld_nl80211_state_t* state, uint32_t ifIndex, int32_t dbm);
+ 
++/*
++ * @brief configure limited transmit power level
++ * (Synchronous api)
++ *
++ * @param state nl80211 socket manager context
++ * @param ifIndex wiphy main iface index
++ * @param mloLinkId network interface MLO Link ID, otherwise MLO_LINK_ID_UNKNOWN for non-MLD
++ * @param mbm transmit power level in dbm
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_nl80211_setMloLinkTxPowerLimited(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, int32_t dbm);
++
+ /*
+  * @brief get transmit power level
+  * (Synchronous api)
+@@ -493,6 +534,20 @@ swl_rc_ne wld_nl80211_setTxPowerLimited(wld_nl80211_state_t* state, uint32_t ifI
+  */
+ swl_rc_ne wld_nl80211_getTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int32_t* dbm);
+ 
++/*
++ * @brief get transmit power level
++ * (Synchronous api)
++ *
++ * @param state nl80211 socket manager context
++ * @param ifIndex wiphy main iface index
++ * @param mloLinkId network interface MLO Link ID, otherwise MLO_LINK_ID_UNKNOWN for non-MLD
++ * @param dbm current tx power in dbm
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_nl80211_getMloLinkTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, int32_t* dbm);
++
+ /*
+  * @brief get maximum transmit power level
+  * (Synchronous api)
+diff --git a/include/wld/wld_rad_nl80211.h b/include/wld/wld_rad_nl80211.h
+index 5ab058319..6c3cd6d91 100644
+--- a/include/wld/wld_rad_nl80211.h
++++ b/include/wld/wld_rad_nl80211.h
+@@ -534,4 +534,16 @@ swl_rc_ne wld_rad_nl80211_registerFrame(T_Radio* pRadio, uint16_t type, const ch
+  */
+ swl_rc_ne wld_rad_nl80211_getFirstEnabledVapLinkInfo(T_Radio* pRadio, int32_t* pIfIndex, int8_t* pLinkId);
+ 
++/*
++ * @brief get first active radio's interface mld link info (mld iface index, and mld link id)
++ *
++ * @param pRadio pointer to radio context
++ * @param pIfIndex pointer to mld iface index to be filled
++ * @param pLinkId pointer to mld link id to be filled
++ *
++ * @return SWL_RC_OK in case of success
++ *         <= SWL_RC_ERROR otherwise
++ */
++swl_rc_ne wld_rad_nl80211_getFirstActiveIntfLinkInfo(T_Radio* pRadio, int32_t* pIfIndex, int8_t* pLinkId);
++
+ #endif /* INCLUDE_WLD_WLD_RAD_NL80211_H_ */
+diff --git a/src/nl80211/wld_nl80211_api.c b/src/nl80211/wld_nl80211_api.c
+index a0c4249be..72289953c 100644
+--- a/src/nl80211/wld_nl80211_api.c
++++ b/src/nl80211/wld_nl80211_api.c
+@@ -802,8 +802,12 @@ swl_rc_ne wld_nl80211_setWiphyAntennas(wld_nl80211_state_t* state, uint32_t ifIn
+     return rc;
+ }
+ 
+-static swl_rc_ne s_setTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, enum nl80211_tx_power_setting type, int32_t dbm) {
++static swl_rc_ne s_setTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, enum nl80211_tx_power_setting type, int32_t dbm) {
+     NL_ATTRS(attribs, ARR(NL_ATTR_VAL(NL80211_ATTR_WIPHY_TX_POWER_SETTING, type)));
++
++    if((mloLinkId != MLO_LINK_ID_UNKNOWN) && (mloLinkId >= 0)) {
++        NL_ATTRS_ADD(&attribs, NL_ATTR_VAL(NL80211_ATTR_MLO_LINK_ID, mloLinkId));
++    }
+     if(type != NL80211_TX_POWER_AUTOMATIC) {
+         dbm *= 100;
+         NL_ATTRS_ADD(&attribs, NL_ATTR_VAL(NL80211_ATTR_WIPHY_TX_POWER_LEVEL, dbm));
+@@ -813,27 +817,50 @@ static swl_rc_ne s_setTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, enum
+     return rc;
+ }
+ 
++swl_rc_ne wld_nl80211_setMloLinkTxPowerAuto(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId) {
++    return s_setTxPower(state, ifIndex, mloLinkId, NL80211_TX_POWER_AUTOMATIC, 0);
++}
++
+ swl_rc_ne wld_nl80211_setTxPowerAuto(wld_nl80211_state_t* state, uint32_t ifIndex) {
+-    return s_setTxPower(state, ifIndex, NL80211_TX_POWER_AUTOMATIC, 0);
++    int8_t mloLinkId = -1;
++    return wld_nl80211_setMloLinkTxPowerAuto(state, ifIndex, mloLinkId);
++}
++
++swl_rc_ne wld_nl80211_setMloLinkTxPowerFixed(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, int32_t dbm) {
++    return s_setTxPower(state, ifIndex, mloLinkId, NL80211_TX_POWER_FIXED, dbm);
+ }
+ 
+ swl_rc_ne wld_nl80211_setTxPowerFixed(wld_nl80211_state_t* state, uint32_t ifIndex, int32_t dbm) {
+-    return s_setTxPower(state, ifIndex, NL80211_TX_POWER_FIXED, dbm);
++    int8_t mloLinkId = -1;
++    return wld_nl80211_setMloLinkTxPowerFixed(state, ifIndex, mloLinkId, dbm);
++}
++
++swl_rc_ne wld_nl80211_setMloLinkTxPowerLimited(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, int32_t dbm) {
++    return s_setTxPower(state, ifIndex, mloLinkId, NL80211_TX_POWER_LIMITED, dbm);
+ }
+ 
+ swl_rc_ne wld_nl80211_setTxPowerLimited(wld_nl80211_state_t* state, uint32_t ifIndex, int32_t dbm) {
+-    return s_setTxPower(state, ifIndex, NL80211_TX_POWER_LIMITED, dbm);
++    int8_t mloLinkId = -1;
++    return wld_nl80211_setMloLinkTxPowerLimited(state, ifIndex, mloLinkId, dbm);
+ }
+ 
+-swl_rc_ne wld_nl80211_getTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int32_t* dbm) {
++swl_rc_ne wld_nl80211_getMloLinkTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int8_t mloLinkId, int32_t* dbm) {
+     wld_nl80211_ifaceInfo_t ifaceInfo;
+     swl_rc_ne rc = wld_nl80211_getInterfaceInfo(state, ifIndex, &ifaceInfo);
+     ASSERT_FALSE(rc < SWL_RC_OK, rc, ME, "fail to get radio main iface info");
+-    //return iface txpower or primary link txpower
+-    *dbm = ((!ifaceInfo.txPower) && (ifaceInfo.nMloLinks > 0)) ? ifaceInfo.mloLinks[0].txPower : ifaceInfo.txPower;
++    if((mloLinkId != MLO_LINK_ID_UNKNOWN) && (mloLinkId >= 0) && (ifaceInfo.nMloLinks > (uint8_t) mloLinkId)) {
++        *dbm = ifaceInfo.mloLinks[mloLinkId].txPower;
++    } else {
++        *dbm = ifaceInfo.txPower;
++    }
+     return rc;
+ }
+ 
++swl_rc_ne wld_nl80211_getTxPower(wld_nl80211_state_t* state, uint32_t ifIndex, int32_t* dbm) {
++    int8_t mloLinkId = -1;
++    return wld_nl80211_getMloLinkTxPower(state, ifIndex, mloLinkId, dbm);
++}
++
+ swl_rc_ne wld_nl80211_getMaxTxPowerdBm(wld_nl80211_state_t* state, uint32_t ifIndex, uint32_t freq, int32_t* dbm) {
+     int32_t locDbm = 0;
+     ASSERT_TRUE(freq > 0, SWL_RC_INVALID_PARAM, ME, "invalid freq");
+diff --git a/src/nl80211/wld_rad_nl80211.c b/src/nl80211/wld_rad_nl80211.c
+index 217753c39..fc385e832 100644
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -623,28 +623,43 @@ swl_rc_ne wld_rad_nl80211_setAntennas(T_Radio* pRadio, uint32_t txMapAnt, uint32
+ }
+ 
+ swl_rc_ne wld_rad_nl80211_setTxPowerAuto(T_Radio* pRadio) {
+-    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
+-    return wld_nl80211_setTxPowerAuto(wld_nl80211_getSharedState(), pRadio->index);
++    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "No radio ctx");
++    int8_t mloLinkId = MLO_LINK_ID_UNKNOWN;
++    int32_t index = 0;
++    swl_rc_ne rc = wld_rad_nl80211_getFirstActiveIntfLinkInfo(pRadio, &index, &mloLinkId);
++    ASSERT_FALSE(rc < SWL_RC_OK, SWL_RC_ERROR, ME, "failed to get radio's first active interface");
++    SAH_TRACEZ_INFO(ME, "%s: Set TxPwr auto index(%d), LinkID (%d)", pRadio->Name, index, mloLinkId);
++    return wld_nl80211_setMloLinkTxPowerAuto(wld_nl80211_getSharedState(), index, mloLinkId);
+ }
+ 
+ swl_rc_ne wld_rad_nl80211_setTxPowerFixed(T_Radio* pRadio, int32_t dbm) {
+-    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
+-    return wld_nl80211_setTxPowerFixed(wld_nl80211_getSharedState(), pRadio->index, dbm);
++    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "No radio ctx");
++    int8_t mloLinkId = MLO_LINK_ID_UNKNOWN;
++    int32_t index = 0;
++    swl_rc_ne rc = wld_rad_nl80211_getFirstActiveIntfLinkInfo(pRadio, &index, &mloLinkId);
++    ASSERT_FALSE(rc < SWL_RC_OK, SWL_RC_ERROR, ME, "failed to get radio's first active interface");
++    SAH_TRACEZ_INFO(ME, "%s: Set TxPwr fixed index(%d), LinkID (%d)", pRadio->Name, index, mloLinkId);
++    return wld_nl80211_setMloLinkTxPowerFixed(wld_nl80211_getSharedState(), index, mloLinkId, dbm);
+ }
+ 
+ swl_rc_ne wld_rad_nl80211_setTxPowerLimited(T_Radio* pRadio, int32_t dbm) {
+-    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
+-    return wld_nl80211_setTxPowerLimited(wld_nl80211_getSharedState(), pRadio->index, dbm);
++    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "No radio ctx");
++    int8_t mloLinkId = MLO_LINK_ID_UNKNOWN;
++    int32_t index = 0;
++    swl_rc_ne rc = wld_rad_nl80211_getFirstActiveIntfLinkInfo(pRadio, &index, &mloLinkId);
++    ASSERT_FALSE(rc < SWL_RC_OK, SWL_RC_ERROR, ME, "failed to get radio's first active interface");
++    SAH_TRACEZ_INFO(ME, "%s: Set TxPwr limited index(%d), LinkID (%d)", pRadio->Name, index, mloLinkId);
++    return wld_nl80211_setMloLinkTxPowerLimited(wld_nl80211_getSharedState(), index, mloLinkId, dbm);
+ }
+ 
+ swl_rc_ne wld_rad_nl80211_getTxPower(T_Radio* pRadio, int32_t* dbm) {
+-    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
+-    uint32_t ifIndex = wld_rad_getFirstEnabledIfaceIndex(pRadio);
+-    if(ifIndex <= 0) {
+-        SAH_TRACEZ_ERROR(ME, "%s: rad has no enabled iface", pRadio->Name);
+-        return SWL_RC_ERROR;
+-    }
+-    return wld_nl80211_getTxPower(wld_nl80211_getSharedState(), ifIndex, dbm);
++    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "No radio ctx");
++    int8_t mloLinkId = MLO_LINK_ID_UNKNOWN;
++    int32_t index = 0;
++    swl_rc_ne rc = wld_rad_nl80211_getFirstActiveIntfLinkInfo(pRadio, &index, &mloLinkId);
++    ASSERT_FALSE(rc < SWL_RC_OK, SWL_RC_ERROR, ME, "failed to get radio's first active interface");
++    SAH_TRACEZ_INFO(ME, "%s: Get TxPwr index(%d), LinkID (%d)", pRadio->Name, index, mloLinkId);
++    return wld_nl80211_getMloLinkTxPower(wld_nl80211_getSharedState(), index, mloLinkId, dbm);
+ }
+ 
+ swl_rc_ne wld_rad_nl80211_getMaxTxPowerdBm(T_Radio* pRad, uint16_t channel, int32_t* dbm) {
+@@ -719,6 +734,35 @@ swl_rc_ne wld_rad_nl80211_getFirstEnabledVapLinkInfo(T_Radio* pRadio, int32_t* p
+     return SWL_RC_OK;
+ }
+ 
++swl_rc_ne wld_rad_nl80211_getFirstActiveIntfLinkInfo(T_Radio* pRadio, int32_t* pIfIndex, int8_t* pLinkId) {
++    int8_t ifMloLinkId = MLO_LINK_ID_UNKNOWN;
++    int32_t index = 0;
++    W_SWL_SETPTR(pIfIndex, index);
++    W_SWL_SETPTR(pLinkId, ifMloLinkId);
++    ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "No radio ctx");
++    T_SSID* pSSID = NULL;
++    T_AccessPoint* pAP = wld_rad_getFirstActiveAp(pRadio);
++    if((pAP != NULL) && (pAP->pSSID != NULL)) {
++        pSSID = pAP->pSSID;
++    } else {
++        T_EndPoint* pEP = wld_rad_getFirstActiveEp(pRadio);
++        if((pEP != NULL) && (pEP->pSSID != NULL)) {
++            pSSID = pEP->pSSID;
++        }
++    }
++
++    if(pSSID != NULL) {
++        index = wld_ssid_nl80211_getPrimaryLinkIfIndex(pSSID);
++        ifMloLinkId = wld_ssid_nl80211_getMldLinkId(pSSID);
++
++        W_SWL_SETPTR(pIfIndex, index);
++        W_SWL_SETPTR(pLinkId, ifMloLinkId);
++        return SWL_RC_OK;
++    }
++
++    return SWL_RC_NOT_AVAILABLE;
++}
++
+ swl_rc_ne wld_rad_nl80211_bgDfsStart(T_Radio* pRadio, wld_startBgdfsArgs_t* args) {
+     ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERT_NOT_NULL(args, SWL_RC_INVALID_PARAM, ME, "NULL");
+-- 
+GitLab
+
