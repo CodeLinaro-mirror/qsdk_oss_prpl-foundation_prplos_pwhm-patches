@@ -1,0 +1,32 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 30a8928100b7673818d254db534c17217f9cc746 Mon Sep 17 00:00:00 2001
+From: rayakuma <rayakuma@qti.qualcomm.com>
+Date: Tue, 7 Apr 2026 22:52:23 +0530
+Subject: [PATCH] Radio is not coming up after disable and enable
+Signed-off-by: Rohith Kumar <rayakuma@qti.qualcomm.com>
+
+Change-Id: Iaf91e372122e8abcf6e7756b8e0c9ef97a16192e
+---
+ .../pwhm-v7.8.26/src/Plugin/wifiGen_fsm.c                       | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 6f08926b50..a2f5cbd37f 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -780,7 +780,7 @@ static bool s_doEnableEp(T_EndPoint* pEP, T_Radio* pRad) {
+     ASSERT_TRUE(pEP->toggleBssOnReconnect, true, ME, "%s: do not disable hostapd", pEP->Name);
+     // check if there is a running hostapd in order to disable it in order allow to wpa_supplicant to connect.
+     // Otherwise, wpa_supplicant will fail to connect
+-    if(wifiGen_hapd_isRunning(pRad)) {
++    if(wifiGen_hapd_isRunning(pRad) && !wld_rad_hasMloSupport(pRad)) {
+         wpaSuppStartingAttempts = 0;
+         amxp_timer_new(&wpaSuppTimer, s_startWpaSuppTimer, pEP);
+         amxp_timer_set_interval(wpaSuppTimer, RETRY_DELAY_MS);
+-- 
+2.34.1
+
