@@ -1,0 +1,29 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+From 9a81319156f5a8a5d889c050afa747c1613d3250 Mon Sep 17 00:00:00 2001
+From: Srajana <srajana@qti.qualcomm.com>
+Date: Fri, 17 Apr 2026 18:46:20 +0530
+Subject: [PATCH] set-Default-max-bss
+Signed-off-by: Srajana <srajana@qti.qualcomm.com>
+---
+ odl/wld_radio.odl | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 6fc6d09..5cc3b56 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -2675,7 +2675,7 @@ define probelist_t{
+ 			 * Will also allow to move multi radio BSSIDs closer together when possible.
+ 			 */
+ 			%persistent uint32 NrBssRequired{
+-				default 0;
++				default 16;
+ 			}
+ 
+ 			/**
+-- 
+2.34.1
+
