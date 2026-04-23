@@ -1,0 +1,96 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From b9305f2d5a5eaec1f389a70330711a01317e2cd0 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Thu, 16 Apr 2026 12:09:17 +0530
+Subject: [PATCH] Fix implicit disconnect not clearing AssociatedDevice.Active
+
+When a Wi-Fi client powers off or moves out of range without sending a
+deauth/disassoc frame, hostapd never fires AP-STA-DISCONNECTED and the
+event-driven path never clears AssociatedDevice.*.Active.
+
+Detect this in wifiGen_get_single_station_stats(): if nl80211 GET_STATION
+returns an error for a station the DM still marks active, the station has
+implicitly disconnected.
+
+The disconnect must not be driven synchronously from here because this
+function runs inside the amxd read action callback (_wld_assocDev_getStats_orf
+-> swla_dm_procObjActionRead). amxd returns invalid_action when a write
+transaction is attempted while a read action is in progress on the same
+object. Schedule the disconnect via a 0ms amxp timer so it fires on the next
+event loop iteration, after the read action has completed, allowing all DM
+writes (Active=0, ActiveAssociatedDevices, AssociationCount.Disconnect) to
+succeed.
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_vap.c | 44 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+index adae53b..c7f3a2e 100644
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -354,6 +354,40 @@
+     return SWL_RC_OK;
+ }
+
++typedef struct {
++    amxp_timer_t* timer;
++    T_AccessPoint* pAP;
++    swl_macBin_t mac;
++} s_implicit_dc_ctx_t;
++
++static void s_implicitDcTimerCb(amxp_timer_t* timer _UNUSED, void* priv) {
++    s_implicit_dc_ctx_t* ctx = (s_implicit_dc_ctx_t*) priv;
++    T_AccessPoint* pAP = ctx->pAP;
++    swl_macBin_t mac = ctx->mac;
++    amxp_timer_delete(&ctx->timer);
++    free(ctx);
++    T_AssociatedDevice* pAD = wld_vap_get_existing_station(pAP, &mac);
++    if((pAD != NULL) && pAD->Active) {
++        wld_ad_add_disconnection(pAP, pAD);
++    }
++}
++
++static void s_deferImplicitDisconnect(T_AccessPoint* pAP, T_AssociatedDevice* pAD) {
++    s_implicit_dc_ctx_t* ctx = calloc(1, sizeof(*ctx));
++    if(ctx == NULL) {
++        SAH_TRACEZ_ERROR(ME, "%s: OOM deferring implicit disconnect for %s", pAP->alias, pAD->Name);
++        return;
++    }
++    if(amxp_timer_new(&ctx->timer, s_implicitDcTimerCb, ctx) != 0) {
++        SAH_TRACEZ_ERROR(ME, "%s: timer alloc failed for %s", pAP->alias, pAD->Name);
++        free(ctx);
++        return;
++    }
++    ctx->pAP = pAP;
++    memcpy(ctx->mac.bMac, pAD->MACAddress, SWL_MAC_BIN_LEN);
++    amxp_timer_start(ctx->timer, 0);
++}
++
+ swl_rc_ne wifiGen_get_single_station_stats(T_AssociatedDevice* pAD) {
+     T_AccessPoint* pAP = wld_ad_getAssociatedAp(pAD);
+     ASSERT_NOT_NULL(pAP, SWL_RC_INVALID_STATE, ME, "NULL");
+@@ -375,6 +409,16 @@
+         wld_ap_hostapd_getStaInfo(pAP, pAD);
+     } else {
+         s_resetAssocDevSignalNoise(pAD);
++        /* Station not found in kernel while the DM still marks it active.
++         * This is an implicit disconnect: the client powered off or went out of
++         * range without sending a deauth/disassoc frame, so hostapd never fired
++         * AP-STA-DISCONNECTED and the event-driven path never cleared Active.
++         * Drive the disconnect via a deferred timer so the DM write runs outside
++         * the amxd read action callback, avoiding invalid_action errors.
++         */
++        SAH_TRACEZ_WARNING(ME, "%s: nl80211 GET_STATION failed (rc=%d) for active sta %s: implicit disconnect",
++                           pAP->alias, rc, pAD->Name);
++        s_deferImplicitDisconnect(pAP, pAD);
+     }
+     return SWL_RC_OK;
+ }
+--
+2.34.1
