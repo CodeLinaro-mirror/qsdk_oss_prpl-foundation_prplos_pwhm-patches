@@ -1,0 +1,57 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 6a1a78f62372e014923a19b7f381236dad3122ca Mon Sep 17 00:00:00 2001
+From: Kartheek E <karte@qti.qualcomm.com>
+Date: Sat, 28 Mar 2026 17:16:06 +0530
+Subject: [PATCH] wld priority changing to highest
+
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+
+Change-Id: I1a2d8abdb733fea33bb4c76d7693ff54f3f32b7b
+---
+ .../pwhm-v7.8.26/src/Plugin/wld_plugin.c         | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/Plugin/wld_plugin.c b/src/Plugin/wld_plugin.c
+index 3dc86aeae7..440aec540a 100644
+--- a/src/Plugin/wld_plugin.c
++++ b/src/Plugin/wld_plugin.c
+@@ -63,6 +63,7 @@
+ #include <stdlib.h>
+ #include <debug/sahtrace.h>
+ #include <errno.h>
++#include <sys/resource.h>
+ 
+ #include "wld/wld.h"
+ #include "wld/wld_util.h"
+@@ -84,9 +85,24 @@ static void s_sendLifecycleEvent(wld_lifecycleEvent_e change) {
+ 
+ }
+ 
++static void s_setProcessPriority(void) {
++    errno = 0;
++    if(setpriority(PRIO_PROCESS, 0, -10) != 0) {
++        SAH_TRACEZ_ERROR(ME, "Failed to set process priority to -10: errno=%d", errno);
++        return;
++    }
++
++    errno = 0;
++    (void) getpriority(PRIO_PROCESS, 0);
++    if(errno != 0) {
++        SAH_TRACEZ_ERROR(ME, "Priority set to -10 but unable to read it back: errno=%d", errno);
++    }
++}
++
+ static void s_addGenRadiosAndLoadConf(void* userdata _UNUSED) {
+     wifiGen_addRadios();
+     wld_persist_onStart();
++    s_setProcessPriority();
+ }
+ 
+ void _app_start(const char* const event_name _UNUSED,
+-- 
+2.43.0
+

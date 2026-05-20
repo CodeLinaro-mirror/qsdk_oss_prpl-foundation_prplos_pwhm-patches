@@ -1,0 +1,970 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 75454b31d752c60a4182c50c6d8c0c78389b575f Mon Sep 17 00:00:00 2001
+From: Anjitha Nattayikkal <anattayi@qti.qualcomm.com>
+Date: Thu, 23 Apr 2026 10:20:00 +0530
+Subject: [PATCH] WLAN-Stats-change
+Signed-off-by: Anjitha Nattayikkal <anattayi@qti.qualcomm.com>
+---
+ include/wld/wld_nl80211_api.h               |   2 +-
+ include_priv/nl80211/wld_nl80211_api_priv.h |   2 +-
+ odl/wld_radio.odl                           |   6 +
+ odl/wld_ssid.odl                            |   6 +
+ src/Utils/wld_linuxIfStats.c                | 610 +++++++++++++++++++-
+ src/nl80211/wld_ap_nl80211.c                |   2 +-
+ src/nl80211/wld_nl80211_api.c               |   8 +-
+ src/nl80211/wld_nl80211_core.c              |  23 +-
+ src/nl80211/wld_rad_nl80211.c               |   2 +-
+ src/wld_radio.c                             |  11 +-
+ src/wld_ssid.c                              |  29 +-
+ 11 files changed, 653 insertions(+), 48 deletions(-)
+
+diff --git a/include/wld/wld_nl80211_api.h b/include/wld/wld_nl80211_api.h
+index 5d3b431..aa57513 100644
+--- a/include/wld/wld_nl80211_api.h
++++ b/include/wld/wld_nl80211_api.h
+@@ -651,7 +651,7 @@ swl_rc_ne wld_nl80211_sendVendorSubCmd(wld_nl80211_state_t* state, uint32_t oui,
+  */
+ swl_rc_ne wld_nl80211_sendVendorSubCmdAttr(wld_nl80211_state_t* state, uint32_t oui, int subcmd, wld_nl80211_nlAttr_t* vendorAttr,
+                                            bool isSync, bool withAck, uint32_t flags, uint32_t ifIndex, uint64_t wDevId,
+-                                           wld_nl80211_handler_f handler, void* priv);
++                                           wld_nl80211_handler_f handler, void* priv, bool* pDoneFlag);
+
+ /*
+  * @brief common function to send a management frame cmd
+diff --git a/include_priv/nl80211/wld_nl80211_api_priv.h b/include_priv/nl80211/wld_nl80211_api_priv.h
+index b2ea060..897b790 100644
+--- a/include_priv/nl80211/wld_nl80211_api_priv.h
++++ b/include_priv/nl80211/wld_nl80211_api_priv.h
+@@ -105,7 +105,7 @@ swl_rc_ne wld_nl80211_addNlAttrs(struct nl_msg* msg, wld_nl80211_nlAttrList_t* c
+  */
+ swl_rc_ne wld_nl80211_sendCmd(bool isSync, wld_nl80211_state_t* state, uint32_t cmd, uint32_t flags,
+                               uint32_t ifIndex, wld_nl80211_nlAttrList_t* const pAttrList,
+-                              wld_nl80211_handler_f handler, void* priv, swl_rc_ne* pResult);
++                              wld_nl80211_handler_f handler, void* priv, swl_rc_ne* pResult, bool* pDoneFlag);
+
+ /*
+  * @brief common function to send synchronous request
+diff --git a/odl/wld_radio.odl b/odl/wld_radio.odl
+index 6fc6d09..1b24b49 100644
+--- a/odl/wld_radio.odl
++++ b/odl/wld_radio.odl
+@@ -1558,6 +1558,12 @@ define probelist_t{
+ 		%read-only object Stats{
+ 			on action read call wld_radio_getStats_orf;
+
++			/** Enables Netlink-based stats collection. When false (default),
++			 *  no Netlink commands are issued and cached values are returned. */
++			%persistent bool Enable {
++				default false;
++			}
++
+ 			/** The total number of bytes transmitted out of the
+ 			 *  interface, including framing characters. */
+ 			%volatile %read-only uint64 BytesSent;
+diff --git a/odl/wld_ssid.odl b/odl/wld_ssid.odl
+index ffdcf9b..af8a529 100644
+--- a/odl/wld_ssid.odl
++++ b/odl/wld_ssid.odl
+@@ -235,6 +235,12 @@
+ 		%read-only object Stats{
+ 			on action read call wld_ssid_getStats_orf;
+
++			/** Enables Netlink-based stats collection. When false (default),
++			 *  no Netlink commands are issued and cached values are returned. */
++			%persistent bool Enable {
++				default false;
++			}
++
+ 			/** The total number of bytes transmitted out of the
+ 			 *  interface, including framing characters. */
+ 			%volatile %read-only uint64 BytesSent;
+diff --git a/src/Utils/wld_linuxIfStats.c b/src/Utils/wld_linuxIfStats.c
+index 3d1b822..af14810 100644
+--- a/src/Utils/wld_linuxIfStats.c
++++ b/src/Utils/wld_linuxIfStats.c
+@@ -68,12 +68,28 @@
+ #include <debug/sahtrace.h>
+
+ #include <string.h>
++#include <time.h>
+ #include <sys/types.h>
+ #include <sys/socket.h>
++#include <sys/ioctl.h>
+ #include <linux/socket.h>
+ #include <linux/types.h>
+ #include <linux/netlink.h>
+ #include <linux/rtnetlink.h>
++#include "wld_linuxIfUtils.h"
++/*
++ * WiFi Telemetry via NL80211 vendor command.
++ */
++#include <netlink/netlink.h>
++#include <linux/nl80211.h>
++#include <netlink/attr.h>
++#include <netlink/msg.h>
++#include <net/if.h>
++
++/* pwhm nl80211 framework */
++#include "wld_nl80211_api.h"
++#include "wld_nl80211_attr.h"
++#include "wld_nl80211_events.h"
+
+ #define ME "linuxIfStats"
+
+@@ -84,6 +100,76 @@
+
+ #define IFLIST_REPLY_BUFFER 8192
+
++/* QCA vendor ID */
++#define QCA_NL80211_VENDOR_ID               0x001374
++
++/* QCA vendor subcmd for WDEV telemetry (VAP/STA level) */
++#define QCA_NL80211_VENDOR_SUBCMD_WLAN_TELEMETRY_WDEV_VAL  263
++
++/*
++ * The driver sends the telemetry event with the SAME subcmd value as the
++ * command (263).
++ */
++#define QCA_NL80211_VENDOR_SUBCMD_WLAN_WDEV_TELEMETRY_EVENT_VAL  \
++    QCA_NL80211_VENDOR_SUBCMD_WLAN_TELEMETRY_WDEV_VAL   /* = 263 */
++
++/* Stats object: VAP = 1 */
++#define TELEMETRY_STATS_OBJ_VAP             1
++
++/* QCA_VENDOR_ATTR_WLAN_TELEMETRY_* (request attributes) */
++#define TELE_ATTR_OBJECT                    1   /* QCA_VENDOR_ATTR_WLAN_TELEMETRY_OBJECT    (u8)  */
++#define TELE_ATTR_FEATURE                   2   /* QCA_VENDOR_ATTR_WLAN_TELEMETRY_FEATURE   (nested flags) */
++#define TELE_ATTR_REQUEST_ID                4   /* QCA_VENDOR_ATTR_WLAN_TELEMETRY_REQUEST_ID (u64) */
++
++/* Feature flag attributes */
++#define TELE_FEAT_TX                        1   /* QCA_VENDOR_ATTR_WLAN_FEAT_TX (flag) */
++#define TELE_FEAT_RX                        2   /* QCA_VENDOR_ATTR_WLAN_FEAT_RX (flag) */
++
++/* Reply event attributes */
++#define TELE_EVT_ATTR_OBJECT                1
++#define TELE_EVT_ATTR_LINK_ID               2
++#define TELE_EVT_ATTR_REQUEST_ID            3
++#define TELE_EVT_ATTR_TX_STATS              4
++#define TELE_EVT_ATTR_RX_STATS              5
++#define TELE_EVT_ATTR_MAX                   8
++
++/* TX stats event nested attributes */
++#define TELE_TX_STATS_PER_PKT               2
++#define TELE_TX_STATS_MAX                   3
++
++/* RX stats event nested attributes */
++#define TELE_RX_STATS_PER_PKT               5
++#define TELE_RX_STATS_MAX                   5
++
++/* TCL/REO ring attributes */
++#define TELE_TCL_RING_MAX                   4
++#define TELE_REO_RING_MAX                   4
++
++/* Per-packet TX stats attributes (enum qca_vendor_wlan_telemetry_stats_tx) */
++#define TELE_TX_PKT_FAILED                  3   /* QCA_VENDOR_ATTR_PER_PKT_STATS_TX_FAILED          (u32)    */
++#define TELE_TX_PKT_MCAST                   14  /* QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_MCAST   (nested) */
++#define TELE_TX_PKT_UCAST                   15  /* QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_UCAST   (nested) */
++#define TELE_TX_PKT_BCAST                   16  /* QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_BCAST   (nested) */
++#define TELE_TX_PKT_MAX                     16
++
++/* Per-packet RX stats attributes (enum qca_vendor_wlan_telemetry_per_pkt_stats_rx_attr) */
++#define TELE_RX_PKT_MCAST                   4   /* QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_MCAST   (nested) */
++#define TELE_RX_PKT_UCAST                   5   /* QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_UCAST   (nested) */
++#define TELE_RX_PKT_BCAST                   6   /* QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_BCAST   (nested) */
++#define TELE_RX_PKT_FAILED                  7   /* QCA_VENDOR_ATTR_PER_PKT_STATS_RX_FAILED          (u32)    */
++#define TELE_RX_PKT_MAX                     10
++
++/* Packet info attributes */
++#define TELE_PKTINFO_PKTS                   1   /* QCA_VENDOR_WLAN_TELEMETRY_ATTR_PKTINFO_PKTS  (u32) */
++#define TELE_PKTINFO_BYTES                  2   /* QCA_VENDOR_WLAN_TELEMETRY_ATTR_PKTINFO_BYTES (u64) */
++#define TELE_PKTINFO_MAX                    2
++
++/*
++ * Request ID: simple monotonic counter.
++ * Used to match the async vendor event reply to the specific request.
++ */
++#define TELE_REQ_ID_MASK                    0xFFFFFFFF
++
+
+ /**
+  * PRIVATE STURCTURS
+@@ -95,11 +181,450 @@ typedef struct {
+     struct rtgenmsg gen; // General form of address family dependent message
+ } nl_req_t;
+
++/**
++ * @brief Holds the WiFi telemetry packet stats parsed from the vendor event.
++ *
++ * All packet/byte counts are summed across all hardware rings.
++ */
++typedef struct {
++    /* RX stats */
++    uint32_t rxFailed;          /**< QCA_VENDOR_ATTR_PER_PKT_STATS_RX_FAILED            */
++    uint32_t mcastRxPackets;    /**< QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_MCAST pkts */
++    uint64_t mcastRxBytes;      /**< QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_MCAST bytes */
++    uint32_t ucastRxPackets;    /**< QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_UCAST pkts */
++    uint64_t ucastRxBytes;      /**< QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_UCAST bytes */
++    uint32_t bcastRxPackets;    /**< QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_BCAST pkts */
++    uint64_t bcastRxBytes;      /**< QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_BCAST bytes */
++    /* TX stats */
++    uint32_t txFailed;          /**< QCA_VENDOR_ATTR_PER_PKT_STATS_TX_FAILED            */
++    uint32_t mcastTxPackets;    /**< QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_MCAST pkts */
++    uint64_t mcastTxBytes;      /**< QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_MCAST bytes */
++    uint32_t ucastTxPackets;    /**< QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_UCAST pkts */
++    uint64_t ucastTxBytes;      /**< QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_UCAST bytes */
++    uint32_t bcastTxPackets;    /**< QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_BCAST pkts */
++    uint64_t bcastTxBytes;      /**< QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_BCAST bytes */
++    /* Control */
++    bool     received;          /**< Set to true when a matching vendor event is received */
++    uint64_t requestId;         /**< Request ID echoed by driver; used to match the reply */
++} s_wifiTelemetryPktStats_t;
++
++
++/**
++ * PRIVATE FUNCTIONS - WiFi Telemetry stat parsers
++ */
++
++/**
++ * @brief Parse a nested pkt_info attribute and accumulate packets/bytes.
++ */
++static void s_teleParsePktInfo(struct nlattr* tb, uint32_t* packets, uint64_t* bytes) {
++    struct nlattr* pktAttr[TELE_PKTINFO_MAX + 1];
++    memset(pktAttr, 0, sizeof(pktAttr));
++
++    if(nla_parse_nested(pktAttr, TELE_PKTINFO_MAX, tb, NULL) != 0) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: failed to parse pkt_info nested attr");
++        return;
++    }
++
++    if(pktAttr[TELE_PKTINFO_PKTS])
++        *packets += nla_get_u32(pktAttr[TELE_PKTINFO_PKTS]);
++
++    if(pktAttr[TELE_PKTINFO_BYTES])
++        *bytes += nla_get_u64(pktAttr[TELE_PKTINFO_BYTES]);
++}
+
+ /**
+- * FUNCTIONS
++ * @brief Parse TX stats nested attribute from the vendor event.
++ *
++ * Iterates over all TCL rings and accumulates TX_FAILED, TX_MCAST, TX_UCAST, TX_BCAST.
+  */
++static void s_teleParseTxStats(struct nlattr* txStatsTb, s_wifiTelemetryPktStats_t* pStats) {
++    struct nlattr* txStats[TELE_TX_STATS_MAX + 1];
++    struct nlattr* tclRing[TELE_TCL_RING_MAX + 1];
++    int ring = 0;
++
++    memset(txStats, 0, sizeof(txStats));
++    memset(tclRing, 0, sizeof(tclRing));
++
++    if(nla_parse_nested(txStats, TELE_TX_STATS_MAX, txStatsTb, NULL) != 0) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: failed to parse TX stats nested attr");
++        return;
++    }
++
++    if(!txStats[TELE_TX_STATS_PER_PKT])
++        return;
++
++    if(nla_parse_nested(tclRing, TELE_TCL_RING_MAX,
++                        txStats[TELE_TX_STATS_PER_PKT], NULL) != 0) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: failed to parse TCL ring nested attr");
++        return;
++    }
+
++    for(ring = 0; ring < TELE_TCL_RING_MAX; ring++) {
++        if(!tclRing[ring + 1])
++            continue;
++
++        struct nlattr* txPkt[TELE_TX_PKT_MAX + 1];
++        memset(txPkt, 0, sizeof(txPkt));
++
++        if(nla_parse_nested(txPkt, TELE_TX_PKT_MAX, tclRing[ring + 1], NULL) != 0)
++            continue;
++
++        if(txPkt[TELE_TX_PKT_FAILED])
++            pStats->txFailed += nla_get_u32(txPkt[TELE_TX_PKT_FAILED]);
++
++        if(txPkt[TELE_TX_PKT_MCAST])
++            s_teleParsePktInfo(txPkt[TELE_TX_PKT_MCAST],
++                               &pStats->mcastTxPackets, &pStats->mcastTxBytes);
++
++        if(txPkt[TELE_TX_PKT_UCAST])
++            s_teleParsePktInfo(txPkt[TELE_TX_PKT_UCAST],
++                               &pStats->ucastTxPackets, &pStats->ucastTxBytes);
++
++        if(txPkt[TELE_TX_PKT_BCAST])
++            s_teleParsePktInfo(txPkt[TELE_TX_PKT_BCAST],
++                               &pStats->bcastTxPackets, &pStats->bcastTxBytes);
++    }
++}
++
++/**
++ * @brief Parse RX stats nested attribute from the vendor event.
++ *
++ * Iterates over all REO rings and accumulates RX_FAILED, RX_MCAST, RX_UCAST, RX_BCAST.
++ */
++static void s_teleParseRxStats(struct nlattr* rxStatsTb, s_wifiTelemetryPktStats_t* pStats) {
++    struct nlattr* rxStats[TELE_RX_STATS_MAX + 1];
++    struct nlattr* reoRing[TELE_REO_RING_MAX + 1];
++    int ring = 0;
++
++    memset(rxStats, 0, sizeof(rxStats));
++    memset(reoRing, 0, sizeof(reoRing));
++
++    if(nla_parse_nested(rxStats, TELE_RX_STATS_MAX, rxStatsTb, NULL) != 0) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: failed to parse RX stats nested attr");
++        return;
++    }
++
++    if(!rxStats[TELE_RX_STATS_PER_PKT])
++        return;
++
++    if(nla_parse_nested(reoRing, TELE_REO_RING_MAX,
++                        rxStats[TELE_RX_STATS_PER_PKT], NULL) != 0) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: failed to parse REO ring nested attr");
++        return;
++    }
++
++    for(ring = 0; ring < TELE_REO_RING_MAX; ring++) {
++        if(!reoRing[ring + 1])
++            continue;
++
++        struct nlattr* rxPkt[TELE_RX_PKT_MAX + 1];
++        memset(rxPkt, 0, sizeof(rxPkt));
++
++        if(nla_parse_nested(rxPkt, TELE_RX_PKT_MAX, reoRing[ring + 1], NULL) != 0)
++            continue;
++
++        if(rxPkt[TELE_RX_PKT_FAILED])
++            pStats->rxFailed += nla_get_u32(rxPkt[TELE_RX_PKT_FAILED]);
++
++        if(rxPkt[TELE_RX_PKT_MCAST])
++            s_teleParsePktInfo(rxPkt[TELE_RX_PKT_MCAST],
++                               &pStats->mcastRxPackets, &pStats->mcastRxBytes);
++
++        if(rxPkt[TELE_RX_PKT_UCAST])
++            s_teleParsePktInfo(rxPkt[TELE_RX_PKT_UCAST],
++                               &pStats->ucastRxPackets, &pStats->ucastRxBytes);
++
++        if(rxPkt[TELE_RX_PKT_BCAST])
++            s_teleParsePktInfo(rxPkt[TELE_RX_PKT_BCAST],
++                               &pStats->bcastRxPackets, &pStats->bcastRxBytes);
++    }
++}
++
++
++/**
++ * PRIVATE FUNCTIONS - pwhm nl80211 callbacks
++ */
++
++/**
++ * @brief Vendor event callback registered via wld_nl80211_addVendorEvtListener().
++ *
++ * @param pRef   Unused (NULL).
++ * @param pData  Pointer to s_wifiTelemetryPktStats_t (passed as pData to addEvtListener).
++ * @param nlh    Netlink message header of the vendor event.
++ * @param tb     Pre-parsed NL80211_ATTR_* attribute table.
++ */
++static void s_teleVendorEvtCb(void* pRef, void* pData,
++                               struct nlmsghdr* nlh, struct nlattr* tb[]) {
++    (void)pRef;
++    s_wifiTelemetryPktStats_t* pStats = (s_wifiTelemetryPktStats_t*)pData;
++
++    if(!pStats || pStats->received)
++        return;
++
++    /* Filter: QCA vendor ID */
++    if(!tb[NL80211_ATTR_VENDOR_ID] || !tb[NL80211_ATTR_VENDOR_SUBCMD])
++        return;
++    if(nla_get_u32(tb[NL80211_ATTR_VENDOR_ID]) != QCA_NL80211_VENDOR_ID)
++        return;
++
++    /* Filter: WDEV telemetry event subcmd (= 263, same as command subcmd) */
++    if(nla_get_u32(tb[NL80211_ATTR_VENDOR_SUBCMD]) !=
++       QCA_NL80211_VENDOR_SUBCMD_WLAN_WDEV_TELEMETRY_EVENT_VAL)
++        return;
++
++    /*
++     * Use wld_nl80211_getVendorDataFromVendorMsg() to extract the
++     * data from the event message.
++     */
++    void*  vendorData    = NULL;
++    size_t vendorDataLen = 0;
++    swl_rc_ne rc = wld_nl80211_getVendorDataFromVendorMsg(SWL_RC_OK, nlh,
++                                                          &vendorData, &vendorDataLen);
++    if((rc < SWL_RC_OK) || (vendorData == NULL)) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: failed to extract vendor data from event");
++        return;
++    }
++
++    /* Parse the event-level attribute table */
++    struct nlattr* evtTb[TELE_EVT_ATTR_MAX + 1];
++    memset(evtTb, 0, sizeof(evtTb));
++    if(nla_parse(evtTb, TELE_EVT_ATTR_MAX,
++                 (struct nlattr*)vendorData, (int)vendorDataLen, NULL) != 0) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: failed to parse event vendor data");
++        return;
++    }
++
++    /* Filter: request ID echoed by driver must match our request */
++    if(evtTb[TELE_EVT_ATTR_REQUEST_ID]) {
++        uint64_t respId = nla_get_u64(evtTb[TELE_EVT_ATTR_REQUEST_ID]);
++        if(respId != pStats->requestId) {
++            SAH_TRACEZ_WARNING(ME,
++                "WiFi telemetry: request ID mismatch (expected 0x%llx, got 0x%llx) - skipping",
++                (unsigned long long)pStats->requestId,
++                (unsigned long long)respId);
++            return;
++        }
++    }
++
++    /* Parse TX stats (per TCL ring) */
++    if(evtTb[TELE_EVT_ATTR_TX_STATS])
++        s_teleParseTxStats(evtTb[TELE_EVT_ATTR_TX_STATS], pStats);
++
++    /* Parse RX stats (per REO ring) */
++    if(evtTb[TELE_EVT_ATTR_RX_STATS])
++        s_teleParseRxStats(evtTb[TELE_EVT_ATTR_RX_STATS], pStats);
++
++    pStats->received = true;
++
++    SAH_TRACEZ_INFO(ME,
++        "WiFi telemetry: vendor event parsed successfully (reqId=0x%llx)",
++        (unsigned long long)pStats->requestId);
++    SAH_TRACEZ_INFO(ME,
++        "  RX: failed=%u  mcast=%u/%llu  ucast=%u/%llu  bcast=%u/%llu",
++        pStats->rxFailed,
++        pStats->mcastRxPackets, (unsigned long long)pStats->mcastRxBytes,
++        pStats->ucastRxPackets, (unsigned long long)pStats->ucastRxBytes,
++        pStats->bcastRxPackets, (unsigned long long)pStats->bcastRxBytes);
++    SAH_TRACEZ_INFO(ME,
++        "  TX: failed=%u  mcast=%u/%llu  ucast=%u/%llu  bcast=%u/%llu",
++        pStats->txFailed,
++        pStats->mcastTxPackets, (unsigned long long)pStats->mcastTxBytes,
++        pStats->ucastTxPackets, (unsigned long long)pStats->ucastTxBytes,
++        pStats->bcastTxPackets, (unsigned long long)pStats->bcastTxBytes);
++}
++
++
++static swl_rc_ne s_teleAckAndWaitHandler(swl_rc_ne rc, struct nlmsghdr* nlh, void* priv _UNUSED) {
++    if(nlh == NULL) {
++        SAH_TRACEZ_WARNING(ME, "WiFi telemetry: request timed out (REQUEST_SYNC_TIMEOUT) without receiving vendor event");
++        return SWL_RC_ERROR;
++    }
++    if(rc <= SWL_RC_ERROR) {
++        SAH_TRACEZ_ERROR(ME, "WiFi telemetry: vendor command failed (rc=%d)", rc);
++        return rc;
++    }
++    if(nlh->nlmsg_type == NLMSG_ERROR) {
++        struct nlmsgerr* e = (struct nlmsgerr*)nlmsg_data(nlh);
++        if(e->error == 0) {
++            SAH_TRACEZ_INFO(ME,
++                "WiFi telemetry: ACK received from driver - "
++                "waiting for vendor event (up to REQUEST_SYNC_TIMEOUT s)...");
++            return SWL_RC_CONTINUE;
++        }
++        SAH_TRACEZ_ERROR(ME,
++            "WiFi telemetry: driver rejected command (err=%d) - "
++            "check interface is up and driver supports subcmd %u",
++            e->error, QCA_NL80211_VENDOR_SUBCMD_WLAN_TELEMETRY_WDEV_VAL);
++        return SWL_RC_ERROR;
++    }
++    return SWL_RC_CONTINUE;
++}
++
++/**
++ * @brief Generate a unique 64-bit request ID (PID-shifted counter).
++ */
++static uint64_t s_teleGenerateRequestId(void) {
++    static uint32_t s_counter = 0;
++    s_counter++;
++    return ((uint64_t)getpid() << 32) | ((uint64_t)s_counter & TELE_REQ_ID_MASK);
++}
++
++/**
++ * @brief Send the QCA WiFi telemetry vendor command and receive the async stats event.
++ */
++static bool s_getWifiTelemetryPacketStats(const char* pIfaceName,
++                                          s_wifiTelemetryPktStats_t* pStats) {
++
++    wld_nl80211_state_t* state = wld_nl80211_getSharedState();
++    if(!state) {
++        SAH_TRACEZ_ERROR(ME,
++            "WiFi telemetry: no shared nl80211 state - "
++            "pwhm nl80211 not initialised yet");
++        return false;
++    }
++
++
++    uint32_t ifIndex = if_nametoindex(pIfaceName);
++    if(ifIndex == 0) {
++        SAH_TRACEZ_ERROR(ME,
++            "WiFi telemetry: interface '%s' not found (if_nametoindex=0)",
++            pIfaceName);
++        return false;
++    }
++
++
++    wld_nl80211_evtHandlers_cb handlers;
++    memset(&handlers, 0, sizeof(handlers));
++
++    wld_nl80211_listener_t* pListener = wld_nl80211_addEvtListener(
++        state,
++        WLD_NL80211_ID_UNDEF,
++        ifIndex,
++        NULL,
++        pStats,
++        &handlers);
++
++    if(!pListener) {
++        SAH_TRACEZ_ERROR(ME,
++            "WiFi telemetry: failed to add event listener for '%s'",
++            pIfaceName);
++        return false;
++    }
++
++
++    wld_nl80211_addVendorEvtListener(state, pListener, s_teleVendorEvtCb);
++
++
++    uint8_t  objVal = (uint8_t)TELEMETRY_STATS_OBJ_VAP;
++    uint64_t reqId  = pStats->requestId;
++
++
++    NL_ATTR_NESTED(vendorDataAttr, NL80211_ATTR_VENDOR_DATA);
++    NL_ATTRS_ADD(&vendorDataAttr.data.attribs, NL_ATTR_VAL(TELE_ATTR_OBJECT, objVal));
++
++    NL_ATTR_NESTED(featAttr, TELE_ATTR_FEATURE);
++    NL_ATTRS_ADD(&featAttr.data.attribs, NL_ATTR(TELE_FEAT_TX));
++    NL_ATTRS_ADD(&featAttr.data.attribs, NL_ATTR(TELE_FEAT_RX));
++    swl_unLiList_add(&vendorDataAttr.data.attribs, &featAttr);
++
++    NL_ATTRS_ADD(&vendorDataAttr.data.attribs, NL_ATTR_VAL(TELE_ATTR_REQUEST_ID, reqId));
++
++
++    SAH_TRACEZ_INFO(ME,
++        "WiFi telemetry: sending NL80211_CMD_VENDOR via pwhm "
++        "[vendorId=0x%04x subcmd=%u ifIndex=%u reqId=0x%llx iface='%s']",
++        QCA_NL80211_VENDOR_ID,
++        QCA_NL80211_VENDOR_SUBCMD_WLAN_TELEMETRY_WDEV_VAL,
++        ifIndex,
++        (unsigned long long)reqId,
++        pIfaceName);
++    SAH_TRACEZ_INFO(ME,
++        "WiFi telemetry: vendor data: OBJECT=%u FEATURE=[TX=%u RX=%u]",
++        TELEMETRY_STATS_OBJ_VAP, TELE_FEAT_TX, TELE_FEAT_RX);
++
++    swl_rc_ne rc = wld_nl80211_sendVendorSubCmdAttr(
++        state,
++        QCA_NL80211_VENDOR_ID,
++        QCA_NL80211_VENDOR_SUBCMD_WLAN_TELEMETRY_WDEV_VAL,
++        &vendorDataAttr,
++        true,
++        false,
++        0,
++        ifIndex,
++        0,
++        s_teleAckAndWaitHandler,
++        pStats,
++        &pStats->received
++    );
++
++
++    /*
++     * Determine success: the vendor event must have been received and its
++     * request ID must have matched (both checked inside s_teleVendorEvtCb).
++     *
++     * We intentionally do NOT gate on (rc >= SWL_RC_OK) here.  The reason is
++     * a framework timing issue: s_teleAckAndWaitHandler can only signal
++     * SWL_RC_DONE when it is called on a *reply* message that carries the
++     * matching sequence number.  After the driver ACK there are no further
++     * reply messages, so the handler is never called again.  The nl80211
++     * sync loop therefore lets the request expire via s_clearExpiredRequests()
++     * which calls s_updateRequest() with rc = SWL_RC_NOT_AVAILABLE.
++     * s_processReply() ignores the handler's SWL_RC_DONE return in that path
++     * (it only propagates the handler result when rc == SWL_RC_OK), so
++     * s_sendMsgSync() ends up returning SWL_RC_NOT_AVAILABLE even though the
++     * vendor event was received successfully before the timeout.
++     *
++     * pStats->received is set inside the sync loop (the listener is still
++     * registered at that point) and the request ID is validated, so the data
++     * is always valid when received == true.
++     */
++    bool success = pStats->received;
++
++    if(!pStats->received) {
++        SAH_TRACEZ_WARNING(ME,
++            "WiFi telemetry: request timed out for iface='%s' "
++            "(no vendor event received within REQUEST_SYNC_TIMEOUT s)", pIfaceName);
++    } else if(rc < SWL_RC_OK) {
++        SAH_TRACEZ_WARNING(ME,
++            "WiFi telemetry: vendor event received for iface='%s' but nl80211 "
++            "request expired before handler could signal completion (rc=%d) - "
++            "treating as success since data is valid (reqId=0x%llx)",
++            pIfaceName, rc, (unsigned long long)pStats->requestId);
++    }
++
++    wld_nl80211_delEvtListener(&pListener);
++
++    if(success) {
++        SAH_TRACEZ_INFO(ME,
++            "WiFi Telemetry Packet Stats for interface '%s':", pIfaceName);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_RX_FAILED          (ErrorsReceived)          = %u",
++            pStats->rxFailed);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_MCAST   (MulticastPacketsReceived) = %u pkts / %llu bytes",
++            pStats->mcastRxPackets, (unsigned long long)pStats->mcastRxBytes);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_UCAST   (UnicastPacketsReceived)   = %u pkts / %llu bytes",
++            pStats->ucastRxPackets, (unsigned long long)pStats->ucastRxBytes);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_RX_PKTINFO_BCAST   (BroadcastPacketsReceived) = %u pkts / %llu bytes",
++            pStats->bcastRxPackets, (unsigned long long)pStats->bcastRxBytes);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_TX_FAILED          (ErrorsSent)              = %u",
++            pStats->txFailed);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_MCAST   (MulticastPacketsSent)    = %u pkts / %llu bytes",
++            pStats->mcastTxPackets, (unsigned long long)pStats->mcastTxBytes);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_UCAST   (UnicastPacketsSent)      = %u pkts / %llu bytes",
++            pStats->ucastTxPackets, (unsigned long long)pStats->ucastTxBytes);
++        SAH_TRACEZ_INFO(ME,
++            "  QCA_VENDOR_ATTR_PER_PKT_STATS_TX_PKTINFO_BCAST   (BroadcastPacketsSent)    = %u pkts / %llu bytes",
++            pStats->bcastTxPackets, (unsigned long long)pStats->bcastTxBytes);
++    }
++
++    return success;
++}
+
+ /**
+  * @brief Gets interface statistics for the given network interface.
+@@ -142,25 +667,28 @@ static bool s_getRtmNewLinkInterfaceStats(const struct nlmsghdr* pMsg, const cha
+             if(ifaceNameMatched) {
+                 struct rtnl_link_stats* stats = (struct rtnl_link_stats*) (RTA_DATA(attribute));
+
+-                pInterfaceStats->BytesSent = stats->tx_bytes;
+-                pInterfaceStats->BytesReceived = stats->rx_bytes;
+-                pInterfaceStats->PacketsSent = stats->tx_packets;
+-                pInterfaceStats->PacketsReceived = stats->rx_packets;
+-                pInterfaceStats->ErrorsSent = stats->tx_errors;
+-                pInterfaceStats->ErrorsReceived = stats->rx_errors;
+-                pInterfaceStats->RetransCount = 0;
+-                pInterfaceStats->DiscardPacketsSent = stats->tx_dropped;
+-                pInterfaceStats->DiscardPacketsReceived = stats->rx_dropped;
+-                pInterfaceStats->UnicastPacketsSent = 0;
+-                pInterfaceStats->UnicastPacketsReceived = 0;
+-                pInterfaceStats->MulticastPacketsSent = 0;
+-                pInterfaceStats->MulticastPacketsReceived = stats->multicast;
+-                pInterfaceStats->BroadcastPacketsSent = 0;
+-                pInterfaceStats->BroadcastPacketsReceived = 0;
++                /* Populate basic stats from RTM_GETLINK */
++                pInterfaceStats->BytesSent                  = stats->tx_bytes;
++                pInterfaceStats->BytesReceived              = stats->rx_bytes;
++                pInterfaceStats->PacketsSent                = stats->tx_packets;
++                pInterfaceStats->PacketsReceived            = stats->rx_packets;
++                pInterfaceStats->RetransCount               = 0;
++                pInterfaceStats->DiscardPacketsSent         = stats->tx_dropped;
++                pInterfaceStats->DiscardPacketsReceived     = stats->rx_dropped;
++                pInterfaceStats->UnicastPacketsSent         = 0;
++                pInterfaceStats->UnicastPacketsReceived     = 0;
++                pInterfaceStats->MulticastPacketsSent       = 0;
++                pInterfaceStats->BroadcastPacketsSent       = 0;
++                pInterfaceStats->BroadcastPacketsReceived   = 0;
+                 pInterfaceStats->UnknownProtoPacketsReceived = 0;
+-                pInterfaceStats->FailedRetransCount = 0;
+-                pInterfaceStats->RetryCount = 0;
+-                pInterfaceStats->MultipleRetryCount = 0;
++                pInterfaceStats->FailedRetransCount         = 0;
++                pInterfaceStats->RetryCount                 = 0;
++                pInterfaceStats->MultipleRetryCount         = 0;
++
++                /* Values from RTM_GETLINK (may be overridden by WiFi telemetry in callers) */
++                pInterfaceStats->ErrorsSent                 = stats->tx_errors;
++                pInterfaceStats->ErrorsReceived             = stats->rx_errors;
++                pInterfaceStats->MulticastPacketsReceived   = stats->multicast;
+
+                 return true;
+             }
+@@ -349,6 +877,48 @@ bool wld_linuxIfStats_getVapStats(T_AccessPoint* pAP, T_Stats* pVapStats) {
+         return false;
+     }
+
++    /*
++     * Augment the basic RTM_GETLINK stats with WiFi-specific telemetry
++     * obtained via the QCA NL80211 vendor command.
++     *
++     * Only send the NL80211 vendor command when the VAP interface is
++     * operationally ready at the kernel level (IFF_RUNNING / IFF_LOWER_UP
++     * set, not just IFF_UP).  This avoids a 5-second blocking timeout when
++     * the interface is administratively up but the driver has not yet
++     * allocated resources (e.g. 6 GHz radio still initialising).
++     */
++    if(wld_linuxIfUtils_getLinkStateExt((char*)pAP->alias) > 0) {
++        s_wifiTelemetryPktStats_t teleStats;
++        memset(&teleStats, 0, sizeof(teleStats));
++        teleStats.requestId = s_teleGenerateRequestId();
++
++        if(s_getWifiTelemetryPacketStats(pAP->alias, &teleStats)) {
++            /* Override RTM_GETLINK fallback values with WiFi-specific counts */
++            pVapStats->ErrorsReceived           = teleStats.rxFailed;
++            pVapStats->MulticastPacketsReceived = teleStats.mcastRxPackets;
++            pVapStats->UnicastPacketsReceived   = teleStats.ucastRxPackets;
++            pVapStats->BroadcastPacketsReceived = teleStats.bcastRxPackets;
++            pVapStats->ErrorsSent               = teleStats.txFailed;
++            pVapStats->MulticastPacketsSent     = teleStats.mcastTxPackets;
++            pVapStats->UnicastPacketsSent       = teleStats.ucastTxPackets;
++            pVapStats->BroadcastPacketsSent     = teleStats.bcastTxPackets;
++        } else {
++            SAH_TRACEZ_WARNING(ME,
++                "WiFi telemetry unavailable for '%s', using RTM_GETLINK fallback "
++                "(ErrorsReceived=%u, MulticastPacketsReceived=%u, ErrorsSent=%u) "
++                "-- UnicastPackets/BroadcastPackets/MulticastPacketsSent will be 0",
++                pAP->alias,
++                pVapStats->ErrorsReceived,
++                pVapStats->MulticastPacketsReceived,
++                pVapStats->ErrorsSent);
++        }
++    } else {
++        SAH_TRACEZ_WARNING(ME,
++            "WiFi telemetry: skipping NL vendor command for '%s' "
++            "(interface not operationally ready - IFF_RUNNING/IFF_LOWER_UP not set)",
++            pAP->alias);
++    }
++
+     amxc_llist_for_each(it, &pAP->llIntfWds) {
+         T_Stats interfaceStats;
+         memset(&interfaceStats, 0, sizeof(interfaceStats));
+@@ -440,5 +1010,3 @@ bool wld_linuxIfStats_getRadioStats(T_Radio* pRadio, T_Stats* pRadioStats) {
+     result |= wld_rad_getCurrentNoise(pRadio, &pRadioStats->noise);
+     return result;
+ }
+-
+-
+diff --git a/src/nl80211/wld_ap_nl80211.c b/src/nl80211/wld_ap_nl80211.c
+index fc01608..f776dc7 100644
+--- a/src/nl80211/wld_ap_nl80211.c
++++ b/src/nl80211/wld_ap_nl80211.c
+@@ -297,7 +297,7 @@ swl_rc_ne wld_ap_nl80211_sendVendorSubCmdAttr(T_AccessPoint* pAP, uint32_t oui,
+     ASSERT_NOT_NULL(pAP, rc, ME, "NULL");
+
+     rc = wld_nl80211_sendVendorSubCmdAttr(wld_nl80211_getSharedState(), oui, subcmd, vendorAttr, isSync, withAck,
+-                                          flags, pAP->index, pAP->wDevId, handler, priv);
++                                          flags, pAP->index, pAP->wDevId, handler, priv, NULL);
+
+     return rc;
+ }
+diff --git a/src/nl80211/wld_nl80211_api.c b/src/nl80211/wld_nl80211_api.c
+index f453c49..1c3c658 100644
+--- a/src/nl80211/wld_nl80211_api.c
++++ b/src/nl80211/wld_nl80211_api.c
+@@ -998,7 +998,7 @@ swl_rc_ne wld_nl80211_getScanResultsPerFreqBand(wld_nl80211_state_t* state, uint
+     pScanResultsData->fScanResultsCb = fScanResultsCb;
+     amxc_llist_init(&pScanResultsData->results.ssids);
+     pScanResultsData->priv = priv;
+-    rc = wld_nl80211_sendCmd(false, state, NL80211_CMD_GET_SCAN, NLM_F_DUMP, ifIndex, NULL, s_scanResultCb, pScanResultsData, NULL);
++    rc = wld_nl80211_sendCmd(false, state, NL80211_CMD_GET_SCAN, NLM_F_DUMP, ifIndex, NULL, s_scanResultCb, pScanResultsData, NULL, NULL);
+     return rc;
+ }
+
+@@ -1091,7 +1091,7 @@ swl_rc_ne wld_nl80211_sendVendorSubCmd(wld_nl80211_state_t* state, uint32_t oui,
+     if(withAck) {
+         rc = wld_nl80211_sendCmdSyncWithAck(state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs);
+     } else {
+-        rc = wld_nl80211_sendCmd(isSync, state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs, handler, priv, NULL);
++        rc = wld_nl80211_sendCmd(isSync, state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs, handler, priv, NULL, NULL);
+     }
+     NL_ATTRS_CLEAR(&attribs);
+
+@@ -1100,7 +1100,7 @@ swl_rc_ne wld_nl80211_sendVendorSubCmd(wld_nl80211_state_t* state, uint32_t oui,
+
+ swl_rc_ne wld_nl80211_sendVendorSubCmdAttr(wld_nl80211_state_t* state, uint32_t oui, int subcmd, wld_nl80211_nlAttr_t* vendorAttr,
+                                            bool isSync, bool withAck, uint32_t flags, uint32_t ifIndex, uint64_t wDevId,
+-                                           wld_nl80211_handler_f handler, void* priv) {
++                                           wld_nl80211_handler_f handler, void* priv, bool* pDoneFlag) {
+     swl_rc_ne rc = SWL_RC_INVALID_PARAM;
+     ASSERT_NOT_NULL(state, rc, ME, "NULL");
+     ASSERT_FALSE((wDevId == 0) && (ifIndex == 0), rc, ME, "devices wDevId and index are 0");
+@@ -1120,7 +1120,7 @@ swl_rc_ne wld_nl80211_sendVendorSubCmdAttr(wld_nl80211_state_t* state, uint32_t
+     if(withAck) {
+         rc = wld_nl80211_sendCmdSyncWithAck(state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs);
+     } else {
+-        rc = wld_nl80211_sendCmd(isSync, state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs, handler, priv, NULL);
++        rc = wld_nl80211_sendCmd(isSync, state, NL80211_CMD_VENDOR, flags, ifIndex, &attribs, handler, priv, NULL, pDoneFlag);
+     }
+     NL_ATTRS_CLEAR(&attribs);
+
+diff --git a/src/nl80211/wld_nl80211_core.c b/src/nl80211/wld_nl80211_core.c
+index 7cfc103..572f7e6 100644
+--- a/src/nl80211/wld_nl80211_core.c
++++ b/src/nl80211/wld_nl80211_core.c
+@@ -114,6 +114,7 @@ typedef struct {
+     bool handlerRunning;           //flag to note whether the handler is currently running
+     swl_rc_ne* pStatus;            //pointer to status, where to save request result before clearing context.
+     uint32_t cmd;
++    bool* pDoneFlag;               //optional: set by caller, checked each loop iteration for early exit
+ } nlRequest_t;
+
+ /*
+@@ -901,12 +902,17 @@ sending_error:
+     return rc;
+ }
+
+-static swl_rc_ne s_sendMsgSync(wld_nl80211_state_t* state, struct nl_msg* msg, wld_nl80211_handler_f handler, void* priv) {
++static swl_rc_ne s_sendMsgSync(wld_nl80211_state_t* state, struct nl_msg* msg, wld_nl80211_handler_f handler, void* priv, bool* pDoneFlag) {
+     SAH_TRACEZ_IN(ME);
+     uint32_t seqId = 0;
+     swl_rc_ne rc = s_sendMsg(state, msg, handler, priv, REQUEST_SYNC_TIMEOUT, &rc, &seqId);
+     ASSERT_EQUALS(rc, SWL_RC_OK, rc, ME, "Fail to send msg");
+
++    nlRequest_t* pInitReq = s_findRequest(state, seqId);
++    if(pInitReq && pDoneFlag) {
++        pInitReq->pDoneFlag = pDoneFlag;
++    }
++
+     //request remains until it is terminated
+     fd_set rfds;
+     while(s_findRequest(state, seqId) != NULL) {
+@@ -922,6 +928,14 @@ static swl_rc_ne s_sendMsgSync(wld_nl80211_state_t* state, struct nl_msg* msg, w
+         //use select to temporize reading from non-blocking socket
+         select(fd + 1, &rfds, NULL, NULL, &timeout);
+         s_readHandler(state->nl_event, priv);
++
++        nlRequest_t* pPollReq = s_findRequest(state, seqId);
++        if(pPollReq && pPollReq->pDoneFlag && *pPollReq->pDoneFlag) {
++            SAH_TRACEZ_INFO(ME, "early exit: done flag set for seqId:%d", seqId);
++            s_freeRequest(pPollReq);
++            rc = SWL_RC_OK;
++            break;
++        }
+     }
+     SAH_TRACEZ_INFO(ME, "retcode = %d", rc);
+     //simplify result: all success retcodes mean successful operation
+@@ -1003,7 +1017,7 @@ static size_t s_getNlMsgAttrSize(wld_nl80211_nlAttrList_t* const pAttrList) {
+
+ swl_rc_ne wld_nl80211_sendCmd(bool isSync, wld_nl80211_state_t* state, uint32_t cmd, uint32_t flags,
+                               uint32_t ifIndex, wld_nl80211_nlAttrList_t* const pAttrList,
+-                              wld_nl80211_handler_f handler, void* priv, swl_rc_ne* pResult) {
++                              wld_nl80211_handler_f handler, void* priv, swl_rc_ne* pResult, bool* pDoneFlag) {
+     swl_rc_ne rc = SWL_RC_ERROR;
+     size_t attrSize = s_getNlMsgAttrSize(pAttrList);
+     struct nl_msg* msg = s_createNlMsg(cmd, attrSize, flags, ifIndex);
+@@ -1015,7 +1029,7 @@ swl_rc_ne wld_nl80211_sendCmd(bool isSync, wld_nl80211_state_t* state, uint32_t
+         return rc;
+     }
+     if(isSync) {
+-        rc = s_sendMsgSync(state, msg, handler, priv);
++        rc = s_sendMsgSync(state, msg, handler, priv, pDoneFlag);
+         if(pResult) {
+             *pResult = rc;
+         }
+@@ -1030,7 +1044,7 @@ swl_rc_ne wld_nl80211_sendCmd(bool isSync, wld_nl80211_state_t* state, uint32_t
+ swl_rc_ne wld_nl80211_sendCmdSync(wld_nl80211_state_t* state, uint32_t cmd, uint32_t flags,
+                                   uint32_t ifIndex, wld_nl80211_nlAttrList_t* const pAttrList,
+                                   wld_nl80211_handler_f handler, void* priv) {
+-    return wld_nl80211_sendCmd(true, state, cmd, flags, ifIndex, pAttrList, handler, priv, NULL);
++    return wld_nl80211_sendCmd(true, state, cmd, flags, ifIndex, pAttrList, handler, priv, NULL, NULL);
+ }
+
+ /*
+@@ -1058,4 +1072,3 @@ swl_rc_ne wld_nl80211_sendCmdSyncWithAck(wld_nl80211_state_t* state, uint32_t cm
+                                          uint32_t ifIndex, wld_nl80211_nlAttrList_t* const pAttrList) {
+     return wld_nl80211_sendCmdSync(state, cmd, flags, ifIndex, pAttrList, s_defaultAckCb, NULL);
+ }
+-
+diff --git a/src/nl80211/wld_rad_nl80211.c b/src/nl80211/wld_rad_nl80211.c
+index 97ea91c..862d77f 100644
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -563,7 +563,7 @@ swl_rc_ne wld_rad_nl80211_sendVendorSubCmdAttr(T_Radio* pRadio, uint32_t oui, in
+     ASSERT_NOT_NULL(pRadio, rc, ME, "NULL");
+
+     rc = wld_nl80211_sendVendorSubCmdAttr(wld_nl80211_getSharedState(), oui, subcmd, vendorAttr, isSync, withAck,
+-                                          flags, pRadio->index, pRadio->wDevId, handler, priv);
++                                          flags, pRadio->index, pRadio->wDevId, handler, priv, NULL);
+
+     return rc;
+ }
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index dcb5461..51cfd42 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -760,12 +760,15 @@ static void s_setGuardInterval_pwf(void* priv _UNUSED, amxd_object_t* object, am
+ }
+
+ static swl_rc_ne s_updateRadioStatsValues(amxd_object_t* const stats) {
+-    T_Radio* pR = wld_rad_fromObj(amxd_object_get_parent(stats));
++    amxd_object_t* radioObj = amxd_object_get_parent(stats);
++    T_Radio* pR = wld_rad_fromObj(radioObj);
+     ASSERT_NOT_NULL(pR, SWL_RC_INVALID_PARAM, ME, "NULL");
+
+-    if(!(wld_rad_hasActiveVap(pR) || wld_rad_hasRunningEndpoint(pR)) || (pR->pFA->mfn_wrad_stats(pR) < 0)) {
+-        // Update the stats with Linux counters if we don't handle them in the plugin.
+-        wld_updateRadioStats(pR, NULL);
++    if(amxd_object_get_bool(stats, "Enable", NULL)) {
++        if(!(wld_rad_hasActiveVap(pR) || wld_rad_hasRunningEndpoint(pR)) || (pR->pFA->mfn_wrad_stats(pR) < 0)) {
++	// Update the stats with Linux counters if we don't handle them in the plugin.
++            wld_updateRadioStats(pR, NULL);
++        }
+     }
+
+     ASSERT_NOT_NULL(stats, SWL_RC_INVALID_PARAM, ME, "stats NULL");
+diff --git a/src/wld_ssid.c b/src/wld_ssid.c
+index ea852d7..b35d86b 100644
+--- a/src/wld_ssid.c
++++ b/src/wld_ssid.c
+@@ -83,6 +83,8 @@
+
+ #define ME "ssid"
+
++#define SSID_STATS_MIN_CACHE_INTERVAL_S  5
++
+ static char* SSID_SupStatus[] = {"Error", "LowerLayerDown", "NotPresent", "Dormant", "Unknown", "Down", "Up", 0};
+
+ static amxc_llist_t sSsidList = {NULL, NULL};
+@@ -750,20 +752,27 @@ static amxd_status_t s_updateSsidStatsValues(T_SSID* pSSID, amxd_object_t* stats
+
+     if(debugIsEpPointer(pEP)) {
+
+-        T_EndPointStats epStats;
+-        memset(&epStats, 0, sizeof(epStats));
+-        if((!wld_rad_hasRunningEndpoint(pEP->pRadio)) || (pEP->pFA->mfn_wendpoint_stats(pEP, &epStats) < SWL_RC_OK)) {
+-            /* Update the stats with Linux counters if we don't handle them in the vendor plugin. */
+-            wld_updateEPStats(pEP, NULL);
+-        } else {
+-            s_copyEpStats(&pSSID->stats, &epStats);
++        if(amxd_object_get_bool(stats, "Enable", NULL)) {
++            T_EndPointStats epStats;
++            memset(&epStats, 0, sizeof(epStats));
++            if((!wld_rad_hasRunningEndpoint(pEP->pRadio)) || (pEP->pFA->mfn_wendpoint_stats(pEP, &epStats) < SWL_RC_OK)) {
++                wld_updateEPStats(pEP, NULL);
++            } else {
++                s_copyEpStats(&pSSID->stats, &epStats);
++            }
+         }
+
+     } else if(debugIsVapPointer(pAP)) {
+
+-        if((pAP->status != APSTI_ENABLED) || (pAP->pFA->mfn_wvap_update_ap_stats(pAP) < SWL_RC_OK)) {
+-            /* Update the stats with Linux counters if we don't handle them in the vendor plugin. */
+-            wld_updateVAPStats(pAP, NULL);
++        if(amxd_object_get_bool(stats, "Enable", NULL)) {
++            swl_timeMono_t now = swl_time_getMonoSec();
++            if((now - pSSID->stats.latestStatsUpdateTime) >= SSID_STATS_MIN_CACHE_INTERVAL_S) {
++                if((pAP->status != APSTI_ENABLED) || (pAP->pFA->mfn_wvap_update_ap_stats(pAP) < SWL_RC_OK)) {
++			/* Update the stats with Linux counters if we don't handle them in the vendor plugin. */
++                    wld_updateVAPStats(pAP, NULL);
++                }
++                pSSID->stats.latestStatsUpdateTime = now;
++            }
+         }
+
+     } else {
+--
+2.34.1
+

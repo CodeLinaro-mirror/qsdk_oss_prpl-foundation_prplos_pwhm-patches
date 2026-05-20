@@ -1,0 +1,66 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 711e121c6673f60d64c6787555d104f345010797 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Wed, 11 Mar 2026 16:11:02 +0530
+Subject: [PATCH] SLO_FIX
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+
+---
+ src/Plugin/wifiGen_fsm.c | 29 +++++++++++++++++++++++++++++
+ 1 file changed, 29 insertions(+)
+
+diff --git a/src/Plugin/wifiGen_fsm.c b/src/Plugin/wifiGen_fsm.c
+index 6f08926..06d08e7 100644
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -504,6 +504,15 @@ static void s_syncOnRadUp(void* userData, char* ifName, bool state) {
+             setBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_DISABLE_HOSTAPD);
+         } else if(pRad->detailedState != CM_RAD_DOWN) {
+             SAH_TRACEZ_WARNING(ME, "%s: hostapd connected but main iface not yet ready", pRad->Name);
++            /* Schedule GEN_FSM_SYNC_STATE so that after the current FSM commit finishes,
++             * s_doSyncState is called. If the WPA ctrl manager failed to reconnect
++             * (e.g. wlan1.1_link0 socket not yet available during HT_SCAN), s_doSyncState
++             * will trigger wld_wpaCtrlMngr_connect() to retry the connection.
++             * This fixes the boot/first-enable case where no evRadChange fires to
++             * schedule GEN_FSM_SYNC_STATE independently, leaving the WPA ctrl
++             * disconnected and subsequent channel changes silently dropped. */
++            setBitLongArray(pRad->fsmRad.FSM_BitActionArray, FSM_BW, GEN_FSM_SYNC_STATE);
++            wld_rad_doCommitIfUnblocked(pRad);
+             return;
+         } else {
+             SAH_TRACEZ_WARNING(ME, "%s: enable hostapd iface %s expected to start", pRad->Name, ifName);
+@@ -738,6 +747,26 @@ static bool s_doSyncState(T_Radio* pRad) {
+             }
+         }
+     }
++    /*
++     * Race condition guard: hostapd daemon is running but wpa_ctrl is not yet
++     * connected. This happens when wpa_ctrl reconnects after a socket switch
++     * (e.g. wlan11 -> wlan11_link0 -> wlan11) and GEN_FSM_SYNC_STATE fires
++     * before the reconnection timer completes.
++     *
++     * Defer the sync: GEN_FSM_SYNC_STATE will be rescheduled by s_syncOnRadUp
++     * once the wpa_ctrl connection is re-established.
++     * If the manager is not already reconnecting, trigger it explicitly.
++     */
++    if(wifiGen_hapd_isRunning(pRad) && !wifiGen_hapd_isAlive(pRad)) {
++        wld_wpaCtrlMngr_t* pMgr = wld_secDmn_getWpaCtrlMgr(pRad->hostapd);
++        if(!wld_wpaCtrlMngr_isConnecting(pMgr)) {
++            SAH_TRACEZ_WARNING(ME, "%s: hostapd running but wpa_ctrl not connected, triggering reconnect", pRad->Name);
++            wld_wpaCtrlMngr_connect(pMgr);
++        } else {
++            SAH_TRACEZ_WARNING(ME, "%s: hostapd running but wpa_ctrl not connected, reconnect in progress", pRad->Name);
++        }
++        return true;
++    }
+     wifiGen_hapd_syncVapStates(pRad);
+     return true;
+ }
+-- 
+2.34.1
+
