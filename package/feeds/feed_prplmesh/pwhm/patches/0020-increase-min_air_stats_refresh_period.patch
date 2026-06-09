@@ -1,0 +1,31 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+From e465c4d5af0438895157a4975aaa517f001663fb Mon Sep 17 00:00:00 2001
+From: Srajana <srajana@qti.qualcomm.com>
+Date: Tue, 9 Jun 2026 23:04:40 +0530
+Subject: [PATCH] increase MIN_AIR_STATS_REFRESH_PERIOD_MS to 900 to reduce cpu
+util
+
+Signed-off-by: Srajana <srajana@qti.qualcomm.com>
+---
+ src/nl80211/wld_rad_nl80211.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/nl80211/wld_rad_nl80211.c b/src/nl80211/wld_rad_nl80211.c
+index b34f0c1..6486d0f 100644
+--- a/src/nl80211/wld_rad_nl80211.c
++++ b/src/nl80211/wld_rad_nl80211.c
+@@ -257,7 +257,7 @@ swl_rc_ne wld_rad_nl80211_getSurveyInfo(T_Radio* pRadio, wld_nl80211_channelSurv
+  * lowest period since last air stats calculation in ms
+  * to avoid too small diff counters
+  */
+-#define MIN_AIR_STATS_REFRESH_PERIOD_MS 100
++#define MIN_AIR_STATS_REFRESH_PERIOD_MS 900
+ swl_rc_ne wld_rad_nl80211_getAirStatsFromSurveyInfo(T_Radio* pRadio, wld_airStats_t* pStats, wld_nl80211_channelSurveyInfo_t* pChanSurveyInfo) {
+     ASSERT_NOT_NULL(pRadio, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERT_NOT_NULL(pStats, SWL_RC_INVALID_PARAM, ME, "NULL");
+-- 
+2.34.1
+
