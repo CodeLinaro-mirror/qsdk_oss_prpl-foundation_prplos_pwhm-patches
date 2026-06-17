@@ -1,0 +1,40 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+Author: Kartheek E <karte@qti.qualcomm.com>
+Date:   17 Jun 2026
+ 
+pwhm: WiFi.AccessPoint.{i}.RadioReference has wrong reference
+ 
+Change-Id: I478a1cb87b6172e165653725cc2007381a4d412f
+Signed-off-by: Kartheek E <karte@qti.qualcomm.com>
+ 
+diff --git a/src/wld_accesspoint.c b/src/wld_accesspoint.c
+--- a/src/wld_accesspoint.c
++++ b/src/wld_accesspoint.c
+@@ -857,19 +857,20 @@ void SyncData_AP2OBJ(amxd_object_t* object, T_AccessPoint* pAP, int set) {
+         wld_util_initCustomAlias(&trans, object);
+ 
+         TBuf[0] = 0;
++       char* lowerLayers = NULL;
+         if(pAP->pSSID != NULL) {
+             char* currSsidRef = amxd_object_get_cstring_t(pAP->pBus, "SSIDReference", NULL);
+             wld_util_getRealReferencePath(TBuf, sizeof(TBuf), currSsidRef, pAP->pSSID->pBus);
++           lowerLayers = amxd_object_get_cstring_t(pAP->pSSID->pBus, "LowerLayers", NULL);
+             free(currSsidRef);
+         }
+         amxd_trans_set_cstring_t(&trans, "SSIDReference", TBuf);
+         TBuf[0] = 0;
+         if(pAP->pRadio) {
+-            char* path = amxd_object_get_path(pAP->pRadio->pBus, AMXD_OBJECT_NAMED);
+-            swl_str_copy(TBuf, sizeof(TBuf), path);
+-            free(path);
++               wld_util_getRealReferencePath(TBuf, sizeof(TBuf), lowerLayers, pAP->pRadio->pBus);
+         }
+         amxd_trans_set_cstring_t(&trans, "RadioReference", TBuf);
++       free(lowerLayers);
+ 
+         amxd_trans_set_int32_t(&trans, "RetryLimit", pAP->retryLimit);
+         amxd_trans_set_bool(&trans, "WMMCapability", pAP->WMMCapability);
