@@ -1,0 +1,79 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 3a9c1e4f8b2d5a7c6e0f1234567890abcdef1234 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Wed, 4 Jun 2026 10:47:53 +0530
+Subject: [PATCH] pwhm: fix SLO to 3link MLO wpa_ctrl reconnect drops MLD
+ link
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_hapd.c | 13 +++++++++++++
+ src/Plugin/wifiGen_vap.c  | 16 ++++++++++++----
+ 2 files changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+index a7c0c84..b3d1e2f 100644
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -530,11 +530,19 @@
+     ASSERTI_TRUE(wld_rad_isMloCapable(pRad), SWL_RC_OK, ME, "%s: not mlo capable", pRad->Name);
+     SAH_TRACEZ_INFO(ME, "%s: applying MLDUnit %d", pAP->alias, pAP->pSSID->mldUnit);
+     /*
+-     * If hostapd is already running this is an MLD reconfiguration (e.g. 3-link -> 2-link).
+-     * Use GEN_FSM_MOD_MLD_CONF so the FSM performs a config reload instead of escalating
+-     * to a full hostapd process restart which would disconnect all associated clients.
++     * Use GEN_FSM_MOD_MLD_CONF (SIGHUP, no client disconnect) only when the
++     * VAP already has an active MLD link (linkId >= 0), meaning it is currently
++     * participating in an MLD group and a SIGHUP is sufficient to update
++     * membership (e.g. N-link -> (N-1)-link or link unit change).
++     * When the VAP has no active link (SLO state, linkId = NO_LINK_ID), use
++     * GEN_FSM_MOD_MLD so s_doSetApMld performs the full MLD group setup.
++     * This correctly handles both the SLO->MLO transition and the already-in-
++     * shared-group case after MLDUnit=-1 sets all links back to SLO.
+      */
+-    if(wifiGen_hapd_isRunning(pRad)) {
++    T_SSID* pSSID = pAP->pSSID;
++    bool isLinkActive = (pSSID != NULL) && (pSSID->pMldLink != NULL) &&
++                        wld_mld_isLinkActive(pSSID->pMldLink);
++    if(wifiGen_hapd_isRunning(pRad) && isLinkActive) {
+         setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD_CONF);
+     } else {
+         setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD);
+diff --git a/src/Plugin/wifiGen_hapd.c b/src/Plugin/wifiGen_hapd.c
+index c4e5f6a..d7g8h9b 100644
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -491,6 +491,18 @@
+                   (pAP->pFA->mfn_wvap_status(pAP) == 0) && (detRadState == CM_RAD_UP)) {
+             //need to restart broadcasting the enabled bss,
+             //that were potentially stopped by hapd when disabling one AP
++            T_SSID* pSSID = pAP->pSSID;
++            /* During a SIGHUP-based MLD group resize, hostapd transiently disables
++             * and re-enables link VAPs itself. A pwhm-issued direct ENABLE on a link
++             * VAP (e.g. wlan11) races against the SIGHUP and brings it up as a
++             * standalone SLO AP instead of as part of the MLD group.
++             * Skip the direct ENABLE if this VAP is an MLD member with neighbours —
++             * hostapd's own reload sequence re-enables it correctly as an MLD link. */
++            if((pSSID != NULL) && (pSSID->mldUnit >= 0) && (pSSID->pMldLink != NULL) &&
++               (wld_mld_countNeighLinks(pSSID->pMldLink) > 1)) {
++                SAH_TRACEZ_WARNING(ME, "%s: MLD group resize in progress - skip direct re-enable",
++                                   pAP->alias);
++            } else {
+             SAH_TRACEZ_INFO(ME, "%s: sync enable vap", pAP->alias);
+             pAP->pFA->mfn_wvap_enable(pAP, pAP->enable, SET | DIRECT);
+             wld_secDmn_action_rc_ne rc;
+@@ -509,6 +521,7 @@
+              * So stations need to re-authenticate to be able to retrieve connection status and stats from nl80211.
+              */
+             wld_ap_hostapd_deauthAllStations(pAP);
++            }
+         }
+         wld_vap_updateState(pAP);
+     }
+--
+2.34.1
+

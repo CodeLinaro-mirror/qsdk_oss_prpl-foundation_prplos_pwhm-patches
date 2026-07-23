@@ -1,0 +1,29 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries. 
+SPDX-License-Identifier: BSD-3-Clause-Clear
+From ef93a2ca3ce43753fc41621baa4279e82a26cda7 Mon Sep 17 00:00:00 2001
+From: Srajana <srajana@qti.qualcomm.com>
+Date: Tue, 9 Jun 2026 11:37:26 +0530
+Subject: [PATCH] throttle station stats polling to reduce cpu utilization
+Signed-off-by: Srajana <srajana@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_vap.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+index 6bfcf71..48c8d8b 100644
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -303,7 +303,7 @@ static uint32_t s_getNetlinkAllStaInfo(T_AccessPoint* pAP) {
+  * lowest period since last refresh of assoc dev info in ms
+  * to avoid too frequent low level requests
+  */
+-#define MIN_AD_INFO_REFRESH_PERIOD_MS 100
++#define MIN_AD_INFO_REFRESH_PERIOD_MS 900
+ static bool s_isStationInfoOld(T_AssociatedDevice* pAD) {
+     ASSERTS_NOT_NULL(pAD, false, ME, "NULL");
+     swl_timeSpecMono_t now = swl_timespec_getMonoVal();
+-- 
+2.34.1
+
