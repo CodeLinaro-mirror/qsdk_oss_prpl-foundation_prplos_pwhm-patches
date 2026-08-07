@@ -1,0 +1,44 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 63d397bd676048fb6be883cae484addb05247cc0 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Tue, 14 Jul 2026 11:08:41 +0530
+Subject: [PATCH] pwhm: fix MLD self-notify SSID race
+
+reconfigureNeighLinkAPs's self-notify SIGHUP fired even for a lone
+MLD member with no siblings, colliding with a same-commit SSID write
+on the shared control socket and causing spurious SSID-set failures.
+
+Only fire the self-notify when countNeighLinks > 1. Real multi-member
+group reconfiguration is unaffected.
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_mld.c | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/Plugin/wifiGen_mld.c b/src/Plugin/wifiGen_mld.c
+index ef3b83b..166ea9c 100644
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -291,7 +291,14 @@ swl_rc_ne wifiGen_mld_reconfigureNeighLinkAPs(T_SSID* pSSID) {
+             wld_autoCommitMgr_notifyVapEdit(pNgAP);
+         }
+     }
+-    if(pSSID->AP_HOOK != NULL) {
++    /* Self-notify only when this link genuinely has siblings to reconfigure
++     * with. For a lone member (countNeighLinks <= 1), hostapd never treats
++     * this BSS as an MLD AP (mld_ap=0, see wld_apMld_hasSharedConnectionConf),
++     * so a self SIGHUP here is a no-op that only races against a concurrently
++     * queued GEN_FSM_MOD_SSID on the same control socket, causing the live
++     * "SET ssid" command to time out (confirmed via DBG traces: hostapd
++     * applies the SSID correctly but its OK reply arrives too late). */
++    if((pSSID->AP_HOOK != NULL) && (pLink != NULL) && (wld_mld_countNeighLinks(pLink) > 1)) {
+         T_AccessPoint* pAP = pSSID->AP_HOOK;
+         SAH_TRACEZ_INFO(ME, "mark AP %s for mld conf refresh", pSSID->Name);
+         setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD_CONF);
+--
+2.34.1
