@@ -1,0 +1,65 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Thu, 27 Aug 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix ghost beacon on Radio.Enable=0
+
+wld_autoCommitMgr_destroy/init in the disable path of
+reconfigureNeighLinkAPs cancelled pending FSM commits even when no
+sibling was actually notified. On all-radio-disable or last-link-disable
+this wiped the disabling radio's own Stop hostapd commit, leaving
+hostapd running (ghost beacon).
+
+Guard destroy/init with a notifiedSibling flag so it only fires
+when at least one enabled sibling was actually told to rebuild.
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_mld.c | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/Plugin/wifiGen_mld.c b/src/Plugin/wifiGen_mld.c
+index ef3b83b..166ea9c 100644
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -233,6 +233,7 @@
+      * a group, isLinkUsable=false but isLinkEnabled=true; using isLinkEnabled
+      * prevents false entry into the disable path for the re-join case. */
+     if((pLink != NULL) && !wld_mld_isLinkEnabled(pLink)) {
++        bool notifiedSibling = false;
+         wld_for_eachNeighMldLink_safe(pNgLink, pLink) {
+             if(pNgLink == pLink) {
+                 continue;
+@@ -247,15 +248,22 @@
+                 wld_mld_saveLinkConfigured(pNgLink, false);
+                 setBitLongArray(pNgAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD);
+                 wld_autoCommitMgr_notifyVapEdit(pNgAP);
++                notifiedSibling = true;
+             }
+         }
+         /* Serialize sibling MOD_MLD commits AFTER the disabling radio FSM commit
+          * (Stop hostapd) completes. At 10+ MLD groups, sibling wpaCtrl sockets
+          * reconnect faster than Stop hostapd, causing setMldParams to rebuild
+          * with the 2.4GHz link still present. destroy/init resets the autoCommit
+-         * timer so siblings execute after the current commit cycle finishes. */
+-        wld_autoCommitMgr_destroy(pSSID->RADIO_PARENT);
+-        wld_autoCommitMgr_init(pSSID->RADIO_PARENT);
++         * timer so siblings execute after the current commit cycle finishes.
++         * Only apply when siblings were actually notified: when all links are
++         * disabled simultaneously (Radio.*.Enable=0) or the last link in a group
++         * is disabled, no siblings are notified and destroy/init would cancel the
++         * disabling radio's own Stop hostapd commit, causing a ghost beacon. */
++        if(notifiedSibling) {
++            wld_autoCommitMgr_destroy(pSSID->RADIO_PARENT);
++            wld_autoCommitMgr_init(pSSID->RADIO_PARENT);
++        }
+         return SWL_RC_OK;
+     }
+     wld_for_eachNeighMldLink_safe(pNgLink, pLink) {
+--
+2.34.1
+
