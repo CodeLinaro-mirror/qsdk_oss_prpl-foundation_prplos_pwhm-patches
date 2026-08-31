@@ -1,0 +1,30 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From e08d8cb08201a32f2476afc1e6b7d17aa3daddcd Mon Sep 17 00:00:00 2001
+From: Srajana <srajana@qti.qualcomm.com>
+Date: Mon, 3 Aug 2026 16:52:23 +0530
+Subject: [PATCH] Fix Stats Enable persistence across reboot
+Signed-off-by: Srajana <srajana@qti.qualcomm.com>
+---
+ odl/wld_ssid.odl | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/odl/wld_ssid.odl b/odl/wld_ssid.odl
+index af8a529..5f99345 100644
+--- a/odl/wld_ssid.odl
++++ b/odl/wld_ssid.odl
+@@ -232,7 +232,7 @@
+ 		    default -1;
+ 		}
+ 
+-		%read-only object Stats{
++		%persistent %read-only object Stats{
+ 			on action read call wld_ssid_getStats_orf;
+ 
+ 			/** Enables Netlink-based stats collection. When false (default),
+-- 
+2.34.1
+

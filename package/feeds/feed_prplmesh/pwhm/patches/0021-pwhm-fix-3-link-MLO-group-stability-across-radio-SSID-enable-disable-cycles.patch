@@ -1,0 +1,150 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From e0c54ab28cf5d418ec86037ccc4266ef78368137 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Fri, 3 Jul 2026 15:20:45 +0530
+Subject: [PATCH] fix 3-link MLO group stability across radio/SSID
+ enable/disable cycles
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ src/Plugin/wifiGen_hapd.c      | 13 +++++++-----
+ src/Plugin/wifiGen_mld.c       | 39 ++++++++++++++++++++++++++--------
+ src/Plugin/wifiGen_vap.c       |  9 +++++++-
+ src/nl80211/wld_ssid_nl80211.c |  5 ++++-
+ src/wld_radio.c                |  5 +++++
+ 5 files changed, 55 insertions(+), 16 deletions(-)
+
+diff --git a/src/Plugin/wifiGen_hapd.c b/src/Plugin/wifiGen_hapd.c
+index 025c075..54fa438 100644
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -496,12 +496,15 @@ swl_rc_ne wifiGen_hapd_syncVapStates(T_Radio* pRad) {
+              * and re-enables link VAPs itself. A pwhm-issued direct ENABLE on a link
+              * VAP (e.g. wlan11) races against the SIGHUP and brings it up as a
+              * standalone SLO AP instead of as part of the MLD group.
+-             * Skip the direct ENABLE if this VAP is an MLD member with neighbours —
+-             * hostapd's own reload sequence re-enables it correctly as an MLD link. */
++             * Skip the direct ENABLE if this VAP is an MLD member with neighbours
++             * (MLD resize in progress), OR if this VAP's own radio is disabled
++             * (e.g. Radio.Enable=0 triggered a sibling rebuild — the disabled VAP
++             * must not be re-activated as a standalone SLO AP by the sibling's
++             * syncVapStates). pAP->pRadio->enable is the DM flag, cleared
++             * immediately on Radio.Enable=0 before any FSM action runs. */
+             if((pSSID != NULL) && (pSSID->mldUnit >= 0) && (pSSID->pMldLink != NULL) &&
+-               (wld_mld_countNeighLinks(pSSID->pMldLink) > 1)) {
+-                SAH_TRACEZ_WARNING(ME, "%s: MLD group resize in progress - skip direct re-enable",
+-                                   pAP->alias);
++               ((wld_mld_countNeighLinks(pSSID->pMldLink) > 1) ||
++                !pAP->pRadio->enable)) {
+             } else {
+             SAH_TRACEZ_INFO(ME, "%s: sync enable vap", pAP->alias);
+             pAP->pFA->mfn_wvap_enable(pAP, pAP->enable, SET | DIRECT);
+diff --git a/src/Plugin/wifiGen_mld.c b/src/Plugin/wifiGen_mld.c
+index b913ca1..ef3b83b 100644
+--- a/src/Plugin/wifiGen_mld.c
++++ b/src/Plugin/wifiGen_mld.c
+@@ -226,15 +226,36 @@ swl_rc_ne wifiGen_mld_reconfigureNeighLinkAPs(T_SSID* pSSID) {
+     }
+
+     wld_mldLink_t* pLink = pSSID->pMldLink;
+-    /* If the triggering link is not usable (AP.Enable=0 or radio down), skip
+-     * notifying siblings with GEN_FSM_MOD_MLD_CONF. The kernel handles MLD
+-     * group reduction when hostapd terminates; firing SIGHUP on siblings during
+-     * a disable sequence causes a transient CTRL-EVENT-TERMINATING that
+-     * s_checkApDependency escalates to GEN_FSM_START_HOSTAPD, leaving the
+-     * disabled VAP on-air as a standalone SLO AP. */
+-    if((pLink != NULL) && !wld_mld_isLinkUsable(pLink)) {
+-        SAH_TRACEZ_INFO(ME, "%s: link not usable (disable path), skip sibling MLD conf refresh",
+-                        pSSID->Name);
++    /* If the triggering link is not usable (AP.Enable=0 or radio down), the
++     * kernel does NOT automatically reduce the MLD group. Siblings must perform
++     * a full MOD_MLD rebuild so s_doSetApMld removes the leaving link.
++     * NOTE: Check !isLinkEnabled not !isLinkUsable — when a link is joining
++     * a group, isLinkUsable=false but isLinkEnabled=true; using isLinkEnabled
++     * prevents false entry into the disable path for the re-join case. */
++    if((pLink != NULL) && !wld_mld_isLinkEnabled(pLink)) {
++        wld_for_eachNeighMldLink_safe(pNgLink, pLink) {
++            if(pNgLink == pLink) {
++                continue;
++            }
++            /* Skip siblings that are themselves disabled (Radio.*.Enable=0). */
++            if(!wld_mld_isLinkEnabled(pNgLink)) {
++                continue;
++            }
++            T_SSID* pNgSSID = wld_mld_getLinkSsid(pNgLink);
++            if((pNgSSID != NULL) && (pNgSSID->AP_HOOK != NULL)) {
++                T_AccessPoint* pNgAP = pNgSSID->AP_HOOK;
++                wld_mld_saveLinkConfigured(pNgLink, false);
++                setBitLongArray(pNgAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD);
++                wld_autoCommitMgr_notifyVapEdit(pNgAP);
++            }
++        }
++        /* Serialize sibling MOD_MLD commits AFTER the disabling radio FSM commit
++         * (Stop hostapd) completes. At 10+ MLD groups, sibling wpaCtrl sockets
++         * reconnect faster than Stop hostapd, causing setMldParams to rebuild
++         * with the 2.4GHz link still present. destroy/init resets the autoCommit
++         * timer so siblings execute after the current commit cycle finishes. */
++        wld_autoCommitMgr_destroy(pSSID->RADIO_PARENT);
++        wld_autoCommitMgr_init(pSSID->RADIO_PARENT);
+         return SWL_RC_OK;
+     }
+     wld_for_eachNeighMldLink_safe(pNgLink, pLink) {
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+index 9c425f6..243db86 100644
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -542,7 +542,14 @@ swl_rc_ne wifiGen_vap_setMldUnit(T_AccessPoint* pAP) {
+     T_SSID* pSSID = pAP->pSSID;
+     bool isLinkActive = (pSSID != NULL) && (pSSID->pMldLink != NULL) &&
+                         wld_mld_isLinkActive(pSSID->pMldLink);
+-    if(wifiGen_hapd_isRunning(pRad) && isLinkActive) {
++    /* Use SIGHUP (MOD_MLD_CONF) only when active AND wpaCtrl is connected.
++     * A cross-unit MLDUnit change causes the old group's hostapd to stop,
++     * taking the wpaCtrl socket with it. If the socket is gone, SIGHUP
++     * would be a no-op -- force MOD_MLD so s_doSetApMld rebuilds from scratch.
++     * wld_wpaCtrlInterface_isReady is false the moment the socket closes,
++     * making it a reliable discriminator for live-group vs cross-unit move. */
++    bool wpaCtrlReady = wld_wpaCtrlInterface_isReady(pAP->wpaCtrlInterface);
++    if(wifiGen_hapd_isRunning(pRad) && isLinkActive && wpaCtrlReady) {
+         setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD_CONF);
+     } else {
+         setBitLongArray(pAP->fsm.FSM_BitActionArray, FSM_BW, GEN_FSM_MOD_MLD);
+diff --git a/src/nl80211/wld_ssid_nl80211.c b/src/nl80211/wld_ssid_nl80211.c
+index fe8b21e..dfdf0d4 100644
+--- a/src/nl80211/wld_ssid_nl80211.c
++++ b/src/nl80211/wld_ssid_nl80211.c
+@@ -116,7 +116,10 @@ swl_rc_ne wld_ssid_nl80211_getMldIfaceInfo(T_SSID* pSSID, wld_nl80211_ifaceInfo_
+ swl_rc_ne wld_ssid_nl80211_getInterfaceInfo(T_SSID* pSSID, wld_nl80211_ifaceInfo_t* pIfaceInfo) {
+     ASSERT_NOT_NULL(pSSID, SWL_RC_INVALID_PARAM, ME, "No ssid");
+     swl_rc_ne rc = SWL_RC_NOT_AVAILABLE;
+-    if(wld_mld_isLinkEnabled(pSSID->pMldLink) || wld_mld_isLinkActive(pSSID->pMldLink)) {
++    /* Guard on isLinkEnabled only: isLinkActive stays true until resetApMldLinks
++     * is called (inside stopDaemon), creating a window where getMldIfaceInfo
++     * fires against a rebuilt MLD group and floods "unmatch linkMac" errors. */
++    if(wld_mld_isLinkEnabled(pSSID->pMldLink)) {
+         rc = wld_ssid_nl80211_getMldIfaceInfo(pSSID, pIfaceInfo, NULL);
+     }
+     if(rc == SWL_RC_NOT_AVAILABLE) {
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index 573a19b..ffa77ad 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -280,6 +280,11 @@ static void s_setEnable_pwf(void* priv _UNUSED, amxd_object_t* object, amxd_para
+         pR->changeInfo.lastDisableTime = swl_time_getMonoSec();
+     }
+
++    /* Set pR->enable to reflect DM value BEFORE setAllMldLinksUnconfigured fires
++     * MLD events. Without this, pRad->enable is still 1 when reconfigureNeighLinkAPs
++     * runs, bypassing the !isLinkEnabled disable path and causing ghost beacons
++     * at multi-group scale. */
++    pR->enable = flag;
+     wld_rad_setAllMldLinksUnconfigured(pR);
+
+     SAH_TRACEZ_OUT(ME);
+--
+2.34.1
+
