@@ -1,0 +1,158 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+From 8b401b4afe381039c689c13d418d6c1360775b22 Mon Sep 17 00:00:00 2001
+From: rayakuma <rayakuma@qti.qualcomm.com>
+Date: Fri, 4 Sep 2026 11:04:51 +0530
+Subject: [PATCH] pwhm changes to bring wifi8 bn related patches in kobuk
+
+Change-Id: I8709595a27156b2c28de1848263115fbd741c697
+Signed-off-by: rayakuma <rayakuma@qti.qualcomm.com>
+---
+ .../include/wld/wld_nl80211_compat.h          |  2 ++
+ .../pwhm-v7.8.26/include/wld/wld_radio.h      |  2 ++
+ .../src/nl80211/wld_hostapd_cfgFile.c         |  4 +++
+ .../src/nl80211/wld_nl80211_parser.c          | 33 +++++++++++++++++++
+ .../pwhm-v7.8.26/src/wld_radio.c              | 26 +++++++++++++++
+ 5 files changed, 67 insertions(+)
+
+diff --git a/include/wld/wld_nl80211_compat.h b/include/wld/wld_nl80211_compat.h
+index 52ba59789d..211351c291 100644
+--- a/include/wld/wld_nl80211_compat.h
++++ b/include/wld/wld_nl80211_compat.h
+@@ -297,6 +297,8 @@
+ #define NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PHY 9
+ #define NL80211_BAND_IFTYPE_ATTR_EHT_CAP_MCS_SET 10
+ #define NL80211_BAND_IFTYPE_ATTR_EHT_CAP_PPE 11
++#define NL80211_BAND_IFTYPE_ATTR_UHR_CAP_MAC 12
++#define NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY 13
+ #define NL80211_CHAN_WIDTH_320 13
+ 
+ //defined since kernel >= 6.0
+diff --git a/include/wld/wld_radio.h b/include/wld/wld_radio.h
+index 4f1003a24c..86e3ceffc0 100644
+--- a/include/wld/wld_radio.h
++++ b/include/wld/wld_radio.h
+@@ -216,6 +216,8 @@ bool wld_rad_hasActiveApMldMultiLink(T_Radio* pRad);
+ bool wld_rad_hasActiveApMld(T_Radio* pRad, uint32_t minNLinks);
+ void wld_rad_setAllMldLinksUnconfigured(T_Radio* pRad);
+ bool wld_rad_hasUsableApMld(T_Radio* pRad, uint32_t minNLinks);
++bool wld_rad_hasConnectedEpWithRadStd(T_Radio* pRad, swl_radStd_e radStd);
++bool wld_rad_is11bnUsable(T_Radio* pRad);
+ 
+ uint32_t wld_rad_getFirstEnabledIfaceIndex(T_Radio* pRad);
+ uint32_t wld_rad_getFirstActiveIfaceIndex(T_Radio* pRad);
+diff --git a/src/nl80211/wld_hostapd_cfgFile.c b/src/nl80211/wld_hostapd_cfgFile.c
+index 7a5a8a8090..7261501d37 100644
+--- a/src/nl80211/wld_hostapd_cfgFile.c
++++ b/src/nl80211/wld_hostapd_cfgFile.c
+@@ -230,6 +230,7 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+     }
+ 
+     bool enableRad11be = wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BE) && wld_rad_hasUsableApMld(pRad, 1);
++    bool enableRad11bn = wld_rad_is11bnUsable(pRad);
+ 
+     swl_channel_t tgtChan = tgtChspec.channel;
+     swl_mapCharFmt_addValInt32(radConfigMap, "channel", tgtChan);
+@@ -473,6 +474,9 @@ void wld_hostapd_cfgFile_setRadioConfig(T_Radio* pRad, swl_mapChar_t* radConfigM
+     if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_BE)) {
+         swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211be", enableRad11be);
+     }
++    if(SWL_BIT_IS_SET(pRad->supportedStandards, SWL_RADSTD_BN)) {
++        swl_mapCharFmt_addValInt32(radConfigMap, "ieee80211bn", enableRad11bn);
++    }
+     if(enableRad11be) {
+         /* ieee80211be: Whether IEEE 802.11be (EHT) is enabled
+          * 0 = disabled (default)
+diff --git a/src/nl80211/wld_nl80211_parser.c b/src/nl80211/wld_nl80211_parser.c
+index 824a448076..167b8bfda6 100644
+--- a/src/nl80211/wld_nl80211_parser.c
++++ b/src/nl80211/wld_nl80211_parser.c
+@@ -719,6 +719,38 @@ static swl_rc_ne s_parseEhtAttrs(struct nlattr* tbBand[], wld_nl80211_bandDef_t*
+     return SWL_RC_DONE;
+ }
+ 
++/**
++ * Parse UHR (802.11bn) band capabilities from nl80211 iftype data.
++ */
++static swl_rc_ne s_parseUhrAttrs(struct nlattr* tbBand[], wld_nl80211_bandDef_t* pBand) {
++    ASSERTS_NOT_NULL(tbBand, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_NOT_NULL(pBand, SWL_RC_INVALID_PARAM, ME, "NULL");
++    ASSERTS_NOT_NULL(tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], SWL_RC_OK, ME, "no iftype data");
++    struct nlattr* nlIfType = NULL;
++    int rem = 0;
++    struct nlattr* tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY + 1] = {};
++    nla_for_each_nested(nlIfType, tbBand[NL80211_BAND_ATTR_IFTYPE_DATA], rem) {
++        nla_parse(tbIfType, NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY, nla_data(nlIfType), nla_len(nlIfType), NULL);
++        if(!s_isSupportedNlIfType(tbIfType[NL80211_BAND_IFTYPE_ATTR_IFTYPES])) {
++            continue;
++        }
++        struct nlattr* uhrCapPhyAttr = tbIfType[NL80211_BAND_IFTYPE_ATTR_UHR_CAP_PHY];
++        if(uhrCapPhyAttr == NULL) {
++            continue;
++        }
++        /* Only set BN if the UHR PHY capability element is non-zero,
++         * i.e. the driver truly advertises 802.11bn (UHR) support. */
++        uint8_t uhrCapPhy[5] = {0};
++        NLA_GET_DATA(uhrCapPhy, uhrCapPhyAttr, sizeof(uhrCapPhy));
++        if(memcmp(uhrCapPhy, &((uint8_t[5]) {0}), sizeof(uhrCapPhy)) != 0) {
++            pBand->radStdsMask |= M_SWL_RADSTD_BN;
++            SAH_TRACEZ_INFO(ME, "UHR (802.11bn) capability detected: setting M_SWL_RADSTD_BN");
++        }
++    }
++    return SWL_RC_DONE;
++}
++
++
+ SWL_TABLE(sChanDfsStatusMap,
+           ARR(uint32_t nl80211ChanStatus; wld_nl80211_chanStatus_e chanStatus; ),
+           ARR(swl_type_uint32, swl_type_uint32, ),
+@@ -862,6 +894,7 @@ swl_rc_ne s_parseWiphyBands(struct nlattr* tb[], wld_nl80211_wiphyInfo_t* pWiphy
+         s_parseVhtAttrs(tbBand, pBand);
+         s_parseHeAttrs(tbBand, pBand);
+         s_parseEhtAttrs(tbBand, pBand);
++        s_parseUhrAttrs(tbBand, pBand);
+         s_parseChans(tbBand, pBand);
+         s_parseDataTransmitRates(tbBand, pBand);
+     }
+diff --git a/src/wld_radio.c b/src/wld_radio.c
+index eca46ede1d..c926b9f57f 100644
+--- a/src/wld_radio.c
++++ b/src/wld_radio.c
+@@ -3710,6 +3710,32 @@ bool wld_rad_hasActiveApMldMultiLink(T_Radio* pRad) {
+     return wld_rad_hasActiveApMld(pRad, 2);
+ }
+ 
++bool wld_rad_hasConnectedEpWithRadStd(T_Radio* pRad, swl_radStd_e radStd) {
++    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
++    T_EndPoint* pEP = NULL;
++    /*
++     * Check if any connected EP with a specific radStd operatingStandard
++     */
++    wld_rad_forEachEp(pEP, pRad) {
++        if(pEP->connectionStatus == EPCS_CONNECTED) {
++            if(pEP->stats.operatingStandard == radStd) {
++                return true;
++            }
++        }
++    }
++    return false;
++}
++
++bool wld_rad_is11bnUsable(T_Radio* pRad) {
++    ASSERTS_NOT_NULL(pRad, false, ME, "NULL");
++    if(wld_rad_hasConnectedEpWithRadStd(pRad, SWL_RADSTD_BN) ||
++       (wld_rad_checkEnabledRadStd(pRad, SWL_RADSTD_BN) &&
++        (!wld_rad_isMloCapable(pRad) || wld_rad_hasUsableApMld(pRad, 1)))) {
++        return true;
++    }
++    return false;
++}
++
+ T_AccessPoint* wld_rad_getFirstActiveAp(T_Radio* pRad) {
+     T_AccessPoint* pAP;
+     wld_rad_forEachAp(pAP, pRad) {
+-- 
+2.34.1
+
