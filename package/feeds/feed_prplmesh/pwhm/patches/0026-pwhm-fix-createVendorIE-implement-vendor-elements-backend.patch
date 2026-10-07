@@ -1,0 +1,149 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Mon, 06 Oct 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix createVendorIE by implementing vendor_elements nl80211 backend
+
+Problem:
+- WiFi.AccessPoint.X.VendorIEs.createVendorIE() has no effect on beacon
+  content: the vendor_elements field in the hostapd config file is never
+  updated and the running hostapd is not notified of the change
+- Root cause: mfn_wvap_add_vendor_ie / mfn_wvap_del_vendor_ie /
+  mfn_wvap_enab_vendor_ie in the nl80211 plugin are left as TRAP
+  (WLD_ERROR_NOT_IMPLEMENTED no-ops)
+
+Fix:
+- Implement wifiGen_vap_add_vendor_ie: rebuilds vendor_elements from
+  the current vendorIEs list (after the new IE was appended by
+  s_addVendorIE_oaf) and applies it to both the running hostapd via
+  wld_ap_hostapd_setParamValue() and the conf file via
+  wld_hostapd_cfgFile_update() for persistence across restarts
+- Implement wifiGen_vap_del_vendor_ie: rebuilds vendor_elements from
+  the current vendorIEs list (after the deleted IE was already removed
+  by amxc_llist_it_take in _wld_ap_delVendorIE_odf) and applies it
+- Implement wifiGen_vap_enab_vendor_ie: when enabled rebuilds from
+  list; when disabled resets to the base device IE only
+- Wire all three into the nl80211 function table in wifiGen.c
+- Add public declarations to wifiGen_vap.h
+- Trigger GEN_FSM_UPDATE_BEACON via FSM bit after setParamValue so
+  the running hostapd reloads the beacon immediately (vendor_elements
+  is not in the auto-update-beacon list in wld_hostapd_ap_api.c)
+
+Format: vendor_elements = dd050026861401<dd<len><oui><data>>...
+  Base IE dd050026861401 is always prepended (device vendor IE).
+  Dynamic IEs are appended as dd<len_2hex><oui_6hex><data_hex> for
+  beacon frame type only (maps to vendor_elements hostapd field).
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+ include_priv/Plugin/wifiGen_vap.h |  3 ++
+ src/Plugin/wifiGen.c              |  3 ++
+ src/Plugin/wifiGen_vap.c          | 71 +++++++++++++++++++++++++++++++
+ 3 files changed, 77 insertions(+)
+
+diff --git a/src/Plugin/wifiGen.c b/src/Plugin/wifiGen.c
+--- a/src/Plugin/wifiGen.c
++++ b/src/Plugin/wifiGen.c
+@@ -180,6 +180,9 @@
+     fta.mfn_wvap_deleted_neighbour = wifiGen_vap_deleted_neighbor;
+     fta.mfn_wvap_set_discovery_method = wifiGen_vap_setDiscoveryMethod;
+     fta.mfn_wvap_setMldUnit = wifiGen_vap_setMldUnit;
++    fta.mfn_wvap_add_vendor_ie = wifiGen_vap_add_vendor_ie;
++    fta.mfn_wvap_del_vendor_ie = wifiGen_vap_del_vendor_ie;
++    fta.mfn_wvap_enab_vendor_ie = wifiGen_vap_enab_vendor_ie;
+
+     //endpoint functions
+     fta.mfn_wendpoint_create_hook = wifiGen_ep_createHook;
+diff --git a/include_priv/Plugin/wifiGen_vap.h b/include_priv/Plugin/wifiGen_vap.h
+--- a/include_priv/Plugin/wifiGen_vap.h
++++ b/include_priv/Plugin/wifiGen_vap.h
+@@ -97,4 +97,7 @@
+ swl_rc_ne wifiGen_vap_setMldUnit(T_AccessPoint* pAP);
+ swl_rc_ne wifiGen_vap_postUpActions(T_AccessPoint* pAP);
+ swl_rc_ne wifiGen_vap_postDownActions(T_AccessPoint* pAP);
++int wifiGen_vap_add_vendor_ie(T_AccessPoint* pAP, wld_vendorIe_t* vendor_ie);
++int wifiGen_vap_del_vendor_ie(T_AccessPoint* pAP, wld_vendorIe_t* vendor_ie);
++int wifiGen_vap_enab_vendor_ie(T_AccessPoint* pAP, int enable);
+ #endif /* INCLUDE_PRIV_PLUGIN_WIFIGEN_VAP_H_ */
+diff --git a/src/Plugin/wifiGen_vap.c b/src/Plugin/wifiGen_vap.c
+--- a/src/Plugin/wifiGen_vap.c
++++ b/src/Plugin/wifiGen_vap.c
+@@ -787,2 +787,74 @@
+     return SWL_RC_OK;
+ }
++
++#define WLD_VENDOR_ELEMENTS_BASE "dd050026861401"
++#define WLD_VENDOR_ELEMENTS_BUF_SIZE 4096
++
++static void s_buildVendorElements(T_AccessPoint* pAP, char* buf, size_t bufSize) {
++    size_t offset = (size_t)snprintf(buf, bufSize, WLD_VENDOR_ELEMENTS_BASE);
++
++    amxc_llist_for_each(it, &pAP->vendorIEs) {
++        const wld_vendorIe_t* ie = amxc_container_of(it, wld_vendorIe_t, it);
++        if(!(ie->frame_type & M_VENDOR_IE_BEACON)) {
++            continue;
++        }
++        if(swl_str_isEmpty(ie->oui) || swl_str_isEmpty(ie->data)) {
++            continue;
++        }
++        /* OUI is "XX:XX:XX" — strip colons to get "XXXXXX" */
++        char ouiHex[7];
++        snprintf(ouiHex, sizeof(ouiHex), "%c%c%c%c%c%c",
++                 ie->oui[0], ie->oui[1], ie->oui[3], ie->oui[4],
++                 ie->oui[6], ie->oui[7]);
++        size_t ieLen = 3 + strlen(ie->data) / 2;
++        int written = snprintf(buf + offset, bufSize - offset,
++                               "dd%02X%s%s", (unsigned)ieLen, ouiHex, ie->data);
++        if((written <= 0) || (offset + (size_t)written >= bufSize)) {
++            break;
++        }
++        offset += (size_t)written;
++    }
++}
++
++static void s_applyVendorElements(T_AccessPoint* pAP, const char* vendorElements) {
++    wld_ap_hostapd_setParamValue(pAP, "vendor_elements", vendorElements, "vendor_ie");
++    wld_ap_hostapd_sendCommand(pAP, "UPDATE_BEACON", "vendor_ie");
++    if(pAP->pRadio && pAP->pRadio->hostapd && pAP->pRadio->hostapd->cfgFile) {
++        wld_hostapd_cfgFile_update(pAP->pRadio->hostapd->cfgFile,
++                                   pAP->alias, "vendor_elements", vendorElements);
++    }
++}
++
++int wifiGen_vap_add_vendor_ie(T_AccessPoint* pAP, wld_vendorIe_t* vendor_ie _UNUSED) {
++    ASSERTS_NOT_NULL(pAP, -1, ME, "NULL");
++    if(!pAP->enableVendorIEs) {
++        return 0;
++    }
++    char vendorElements[WLD_VENDOR_ELEMENTS_BUF_SIZE];
++    s_buildVendorElements(pAP, vendorElements, sizeof(vendorElements));
++    s_applyVendorElements(pAP, vendorElements);
++    return 0;
++}
++
++int wifiGen_vap_del_vendor_ie(T_AccessPoint* pAP, wld_vendorIe_t* vendor_ie _UNUSED) {
++    ASSERTS_NOT_NULL(pAP, -1, ME, "NULL");
++    if(!pAP->enableVendorIEs) {
++        return 0;
++    }
++    char vendorElements[WLD_VENDOR_ELEMENTS_BUF_SIZE];
++    s_buildVendorElements(pAP, vendorElements, sizeof(vendorElements));
++    s_applyVendorElements(pAP, vendorElements);
++    return 0;
++}
++
++int wifiGen_vap_enab_vendor_ie(T_AccessPoint* pAP, int enable) {
++    ASSERTS_NOT_NULL(pAP, -1, ME, "NULL");
++    char vendorElements[WLD_VENDOR_ELEMENTS_BUF_SIZE];
++    if(enable) {
++        s_buildVendorElements(pAP, vendorElements, sizeof(vendorElements));
++    } else {
++        snprintf(vendorElements, sizeof(vendorElements), WLD_VENDOR_ELEMENTS_BASE);
++    }
++    s_applyVendorElements(pAP, vendorElements);
++    return 0;
++}
