@@ -1,0 +1,122 @@
+This patch file is from Qualcomm Technologies, Inc. and is provided under the following license:
+
+Copyright (c) Qualcomm Technologies, Inc. and/or its subsidiaries.
+SPDX-License-Identifier: BSD-3-Clause-Clear
+
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+Date: Tue, 09 Sep 2026 00:00:00 +0530
+Subject: [PATCH] pwhm: fix silent channel change failure after hostapd SIGHUP
+
+Problem:
+- WiFi.Radio.X.Channel=Y is silently dropped with "disconnected, no
+  applying of chanspec" after SSID enable on a non-last radio
+- wpa_ctrl managers of all previously-enabled radios remain permanently
+  disconnected after the SIGHUP issued by wifiGen_hapd_reloadDaemon()
+
+Cause:
+- wld_secDmn_reconnectGrpMgrs() is called synchronously after kill(),
+  before CTRL-EVENT-TERMINATING is delivered; connect() exits early with
+  "already connected" since isConnected() still returns true at that
+  point; when TERMINATING later arrives and sets isReady=false, no
+  reconnect timer is running
+- checkAllIfaces() calls setConnectionInfo() on sockets belonging to
+  sibling managers, issuing DETACH and creating an infinite reconnect
+  loop every 500 ms
+
+Fix:
+- move wld_wpaCtrlMngr_connect() into s_ifaceTerminatingEvt() so it
+  fires after isReady is already false, correctly arming the reconnect
+  timer for every manager that receives TERMINATING
+- guard setConnectionInfo() in checkAllIfaces() with (pCurrMgr == pMgr)
+  to prevent managers from interfering with sibling connections
+- retain wld_secDmn_reconnectGrpMgrs() calls at reload sites as a
+  secondary path for managers already disconnected before the SIGHUP
+- add GEN_FSM_STOP_HOSTAPD + GEN_FSM_START_HOSTAPD fallback in
+  wifiGen_rad_setChanspec() if wpa_ctrl is still dead at channel-change
+  time
+
+Signed-off-by: Jassim Shanavaskhan <jshanava@qti.qualcomm.com>
+---
+--- a/src/nl80211/wld_secDmn.c
++++ b/src/nl80211/wld_secDmn.c
+@@ -243,6 +243,21 @@
+     return SWL_RC_OK;
+ }
+ 
++void wld_secDmn_reconnectGrpMgrs(wld_secDmn_t* pSecDmn) {
++    ASSERTS_NOT_NULL(pSecDmn, , ME, "NULL");
++    if(!wld_secDmn_isGrpMember(pSecDmn)) {
++        wld_wpaCtrlMngr_connect(pSecDmn->wpaCtrlMngr);
++        return;
++    }
++    uint32_t nMbr = wld_secDmnGrp_getMembersCount(pSecDmn->secDmnGroup);
++    for(uint32_t i = 0; i < nMbr; i++) {
++        wld_secDmn_t* pMbr = (wld_secDmn_t*) wld_secDmnGrp_getMemberByPos(pSecDmn->secDmnGroup, i);
++        if(pMbr != NULL) {
++            wld_wpaCtrlMngr_connect(pMbr->wpaCtrlMngr);
++        }
++    }
++}
++
+ swl_rc_ne wld_secDmn_restart(wld_secDmn_t* pSecDmn) {
+     ASSERT_NOT_NULL(pSecDmn, SWL_RC_INVALID_PARAM, ME, "NULL");
+     ASSERT_NOT_NULL(pSecDmn->dmnProcess, SWL_RC_ERROR, ME, "NULL");
+--- a/include/wld/wld_secDmn.h
++++ b/include/wld/wld_secDmn.h
+@@ -132,6 +132,7 @@
+         CALL_MGR_EXT(pSecDmn->wpaCtrlMngr, fName, ifName, __VA_ARGS__) \
+     }
+ 
++void wld_secDmn_reconnectGrpMgrs(wld_secDmn_t* pSecDmn);
+ swl_rc_ne wld_secDmn_addToGrp(wld_secDmn_t* pSecDmn, wld_secDmnGrp_t* pSecDmnGrp, const char* memberName);
+ swl_rc_ne wld_secDmn_delFromGrp(wld_secDmn_t* pSecDmn);
+ wld_secDmnGrp_t* wld_secDmn_getGrp(wld_secDmn_t* pSecDmn);
+--- a/src/Plugin/wifiGen_fsm.c
++++ b/src/Plugin/wifiGen_fsm.c
+@@ -700,6 +700,7 @@
+      */
+     SAH_TRACEZ_INFO(ME, "%s: mld conf refresh via SIGHUP (no full restart)", pAP->alias);
+     wld_secDmn_reload(pRad->hostapd);
++    wld_secDmn_reconnectGrpMgrs(pRad->hostapd);
+     return true;
+ }
+
+--- a/src/Plugin/wifiGen_hapd.c
++++ b/src/Plugin/wifiGen_hapd.c
+@@ -407,6 +407,7 @@
+     if((wifiGen_hapd_countGrpMembers(pRad) < 2) ||
+        ((rc = wld_rad_hostapd_reconfigure(pRad)) < SWL_RC_OK)) {
+         rc = wld_secDmn_reload(pRad->hostapd);
++        wld_secDmn_reconnectGrpMgrs(pRad->hostapd);
+     }
+     return rc;
+ }
+--- a/src/nl80211/wld_wpaCtrl_events.c
++++ b/src/nl80211/wld_wpaCtrl_events.c
+@@ -535,4 +535,5 @@
+     if(isMgrTerm) {
+         CALL_MGR_I(pInterface, fMngrReadyCb, false);
++        wld_wpaCtrlMngr_connect(pInterface->pMgr);
+     }
+ }
+--- a/src/Plugin/wifiGen_rad.c
++++ b/src/Plugin/wifiGen_rad.c
+@@ -992,6 +992,8 @@
+     } else {
+         SAH_TRACEZ_WARNING(ME, "%s: disconnected, no applying of chanspec %s",
+                            pRad->Name, swl_typeChanspecExt_toBuf32(pRad->targetChanspec.chanspec).buf);
++        setBitLongArray(actionArray, FSM_BW, GEN_FSM_STOP_HOSTAPD);
++        setBitLongArray(actionArray, FSM_BW, GEN_FSM_START_HOSTAPD);
+     }
+     rc = SWL_RC_OK;
+ saveConf:
+--- a/src/nl80211/wld_wpaCtrlMngr.c
++++ b/src/nl80211/wld_wpaCtrlMngr.c
+@@ -109,4 +109,5 @@
+-            if(!swl_str_matches(wld_wpaCtrlInterface_getConnectionSockName(pIface), sockName)) {
++            if((pCurrMgr == pMgr) &&
++               (!swl_str_matches(wld_wpaCtrlInterface_getConnectionSockName(pIface), sockName))) {
+                 wld_wpaCtrlInterface_setConnectionInfo(pIface, ctrlDirPath, sockName);
+             }
+             if((pCurrMgr == pMgr) && (!wld_wpaCtrlInterface_isReady(pIface))) {
